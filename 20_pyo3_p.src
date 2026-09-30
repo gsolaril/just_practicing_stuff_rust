@@ -1,0 +1,631 @@
+<VSCode.Cell language="markdown">
+# Rust 120: PyO3 — Practice
+
+Companion exercises for `20_pyo3_e.ipynb`. The chapter splits in two, and so do these exercises: **kernel exercises** (§1–§7, §9–§10) run the plain-Rust shapes behind the macros right here, and the **guided cdylib tasks** (§8) drive the spike20 scratch project — edit `lib.rs`, `cargo build`, rename, `pytest` — recording each receipt as you go.
+
+The checks at the bottom of each kernel cell are the grader. Edit only the `todo!()` bodies; an `Exercise N.M passed` line means you are done.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+### Contents
+
+- [0. How to Complete These Exercises](#0-how-to-complete-these-exercises)
+- [1. The Boundary: Scalars and Ownership](#1-the-boundary-scalars-and-ownership)
+- [2. `pyfunction`: Arguments and Returns](#2-pyfunction-arguments-and-returns)
+- [3. Errors Across the Boundary](#3-errors-across-the-boundary)
+- [4. `pyclass` and `pymethods`](#4-pyclass-and-pymethods)
+- [5. Born Under the Token, Detached to Travel](#5-born-under-the-token-detached-to-travel)
+- [6. Calling Python from Rust](#6-calling-python-from-rust)
+- [7. The GIL: Sections](#7-the-gil-sections)
+- [8. Guided cdylib Tasks](#8-guided-cdylib-tasks)
+- [9. C Strings and the Debug Bound](#9-c-strings-and-the-debug-bound)
+- [10. Mixed Review](#10-mixed-review)
+- [11. What Comes Next](#11-what-comes-next)
+
+§1–§7 and §9 mirror the runnable cells of the example notebook; §8 drives the real extension; §10 mixes corners.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 0. How to Complete These Exercises
+
+This notebook runs on the same **evcxr** kernel as the example notebook. Three consequences shape how you work:
+
+1. **No `fn main`.** The body of a cell *is* the body of `main`. Type statements directly.
+2. **State persists.** A binding from an earlier cell is visible in every cell below it — including `use` lines.
+3. **Items are order-independent.** A struct or fn may be used above the cell that defines it.
+
+> **Item names must be unique across the whole notebook.** Two functions with the same name are a redefinition error even in different sections. The same rule covers `use` lines: the first cell that needs a name is the one that imports; later cells rely on persistence — a repeated `use` is E0252. And a trailing `//` comment after a `use` line's semicolon hides that semicolon from the tooling — put the comment on its own line above.
+
+### The stub convention
+
+Each kernel exercise cell declares signatures with contract doc comments and a `// --- check (do not modify) ---` block of asserts. The body you must fill in is `todo!()`, which compiles but **panics** when executed. Replace it and re-run; an `Exercise N.M passed` line means you are done.
+
+### Expect warnings until you finish
+
+Three warning families are normal and self-cleaning:
+
+- `unused variable` — every unsolved stub whose parameters are untouched;
+- `unused import` — the `use` lines serving a stub you have not solved yet;
+- **stub-induced dead code** (`never used` / `never constructed`) — given helpers that only a *solution* calls.
+
+No stub takes a `mut` binding parameter, so the fourth family is designed out.
+
+### The spike20 desk (for §8)
+
+The guided tasks drive the chapter's scratch project — the same one whose pytest receipts the example notebook quotes:
+
+```text
+C:/Users/GSL/AppData/Local/Temp/spike20/
+  Cargo.toml            [lib] crate-type = ["cdylib"], pyo3 = "0.29"
+  src/lib.rs            the probe module
+  pytest/spike20.pyd    the built module (target/debug/spike20.dll, renamed)
+  pytest/test_spike20.py  the receipt suite: 8 passed
+```
+
+Build loop: `cargo build`, copy `target/debug/spike20.dll` to `pytest/spike20.pyd`, run `python -m pytest test_spike20.py -s` from `pytest/`. Verify before trusting: `python --version` → 3.13.5, `cargo tree` → pyo3 0.29.2.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 1. The Boundary: Scalars and Ownership
+
+Python's `int` is arbitrary precision; `i64` is not. The shim refuses out-of-range values with `OverflowError` — here is that clip as a `Result`, plus the two ownership crossings.
+
+**See**: §0.1 and §1 of the example notebook.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 1.1 The OverflowError mirror, and the two ownership crossings.
+
+/// Accept any Python-sized integer (`i128`) and fit it into the boundary
+/// type: Ok(clamped-to-fit? no — Ok only when it FITS), Err with a message
+/// naming both limits when it does not. The shim raises OverflowError;
+/// this mirror returns Err with the wording.
+fn clip(x: i128) -> Result<i64, String> {
+    todo!()
+}
+
+/// The borrowed crossing: take a `&str`, return a fresh owned String
+/// greeting. The caller's string must be untouched.
+fn greet(name: &str) -> String {
+    todo!()
+}
+
+/// The owning crossing: take a String by value and return it doubled
+/// (`tag/tag`) plus its original length.
+fn consume(tag: String) -> (String, usize) {
+    todo!()
+}
+
+// --- check (do not modify) ---
+assert_eq!(clip(42), Ok(42));
+assert_eq!(clip(i64::MAX as i128), Ok(i64::MAX));
+assert_eq!(clip(i64::MAX as i128 + 1).unwrap_err(),
+    "out of range: 9223372036854775808 exceeds 9223372036854775807");
+assert_eq!(clip(i64::MIN as i128 - 1).is_err(), true);
+let mine = "desk".to_string();
+assert_eq!(greet(&mine), "hello, desk");
+assert_eq!(mine, "desk", "the borrowed crossing left the caller's string intact");
+let (doubled, n) = consume(mine);
+assert_eq!(doubled, "desk/desk");
+assert_eq!(n, 4, "the owning crossing measured BEFORE the move");
+println!("Exercise 1.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 2. `pyfunction`: Arguments and Returns
+
+`#[pyfunction]` reads each parameter's type to generate extraction. These are those signatures — `Vec<i64>`, `HashMap`, `Option`, tuples — as plain fns; Python's `TypeError` on wrong shapes happens in the shim before any body runs.
+
+**See**: §2 of the example notebook.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 2.1 The FromPyObject surface, un-macroed.
+
+/// Sum a list of i64. (Python passed [1, 2, 3]; the shim already copied it.)
+fn sum_list(vals: Vec<i64>) -> i64 {
+    todo!()
+}
+
+/// Count the keys of a dict the shim already decoded into a HashMap.
+fn count_keys(d: std::collections::HashMap<String, i64>) -> usize {
+    todo!()
+}
+
+/// Render an Option<String>: Some(s) -> "some:s", None -> "none".
+fn maybe(x: Option<String>) -> String {
+    todo!()
+}
+
+/// Render a (String, i64) pair as "key=value".
+fn pair_arg(p: (String, i64)) -> String {
+    todo!()
+}
+
+// --- check (do not modify) ---
+assert_eq!(sum_list(vec![1, 2, 3]), 6);
+assert_eq!(sum_list(vec![]), 0, "an empty list crosses as an empty vec");
+assert_eq!(count_keys(std::collections::HashMap::from([
+    ("a".to_string(), 1),
+    ("b".to_string(), 2),
+])), 2);
+assert_eq!(maybe(Some("x".to_string())), "some:x");
+assert_eq!(maybe(None), "none", "None <-> Option, lossless both ways");
+assert_eq!(pair_arg(("px".to_string(), 42)), "px=42");
+println!("Exercise 2.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 3. Errors Across the Boundary
+
+`PyResult<T>` is `Result<T, PyErr>`; your Rust error types cross through `From<E> for PyErr`, which is also what `?` calls inside a pyfunction. The mirror's boundary error is `PyErrMirror` (given, §3.1); the escalation levels are reading exercises.
+
+**See**: §3 of the example notebook.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 3.1 The From bridge, exercised exactly as the shim exercises it.
+// Given: the error types and the From impl — do not modify. The lesson is
+// in USING the bridge, then extending it.
+#[derive(Debug)]
+struct Spill(String);
+
+impl std::fmt::Display for Spill {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "spill: {}", self.0)
+    }
+}
+impl std::error::Error for Spill {}
+
+#[derive(Debug)]
+struct PyErrMirror(String);
+
+impl From<Spill> for PyErrMirror {
+    fn from(e: Spill) -> PyErrMirror {
+        // the From impl decides the Python-visible payload
+        PyErrMirror(e.to_string())
+    }
+}
+
+/// Classify `n` like a pyfunction body: negative -> Err(Spill("negative {n}")),
+/// zero -> Err(Spill("zero has no price")), else Ok(n * 2).
+fn classify(n: i64) -> Result<i64, Spill> {
+    todo!()
+}
+
+/// The generated shim, as the macros write it: run the body, convert the
+/// Err through From — the ? of a pyfunction, spelled out. Do not modify.
+fn shim(n: i64) -> Result<i64, PyErrMirror> {
+    let v = classify(n)?;
+    Ok(v)
+}
+
+/// Run `shim` and report the outcome: Ok(v) -> the value as String;
+/// Err(e) -> the bridged payload (what Python would see).
+fn outcome(n: i64) -> String {
+    todo!()
+}
+
+// --- check (do not modify) ---
+assert_eq!(outcome(21), "42");
+assert_eq!(outcome(-3), "spill: negative -3", "From applied Display deliberately");
+assert_eq!(outcome(0), "spill: zero has no price");
+println!("Exercise 3.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 4. `pyclass` and `pymethods`
+
+A `#[pyclass]` is a struct plus a `#[pymethods]` impl: `#[new]` constructor, opt-in field accessors, computed `#[getter]`, a refusing `#[setter]`, `__repr__`. All of that is ordinary Rust shape — this exercise builds it without the macros.
+
+**See**: §4 of the example notebook.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 4.1 The pyclass surface, un-macroed: the Fill type with its full
+// Python-visible behavior.
+#[derive(Debug)]
+struct Fill {
+    sym: String,
+    qty: i64,
+}
+
+/// The #[new] constructor.
+fn fill_new(sym: &str, qty: i64) -> Fill {
+    todo!()
+}
+
+/// The plain method: qty * 100.
+fn notional(f: &Fill) -> i64 {
+    todo!()
+}
+
+/// The computed #[getter]: "{sym}x{qty}".
+fn label(f: &Fill) -> String {
+    todo!()
+}
+
+/// The refusing #[setter]: always Err with the payload
+/// "label is read-only" — the shim forwards your Err verbatim.
+fn set_label(_f: &mut Fill, _v: &str) -> Result<(), String> {
+    todo!()
+}
+
+/// The __repr__ contract, at the type Rust actually formats: what does
+/// {:?} produce for the sym "AAA"? (Rust Debug speaks double quotes.)
+fn repr_quote() -> String {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let mut f = fill_new("AAA", 100);
+assert_eq!(notional(&f), 10000);
+f.qty = 150;
+assert_eq!(notional(&f), 15000, "get/set fields mutate between calls");
+assert_eq!(label(&f), "AAAx150");
+assert_eq!(set_label(&mut f, "no").unwrap_err(), "label is read-only");
+assert_eq!(repr_quote(), "\"AAA\"");
+println!("Exercise 4.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 5. Born Under the Token, Detached to Travel
+
+Python objects are created holding a `Python<'py>` token (`Bound<'py, T>`); `into()` strips the lifetime to `Py<T>` so the value survives the section. The mirror: `Bound`/`Py` as a lifetime-carrying struct and its detached form, with a guard that counts attach sections.
+
+**See**: §5 and §7 of the example notebook.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 5.1 Bound -> Py as plain Rust, over a real thread boundary: the
+// detached value travels; the token-bound one does not.
+struct Token;
+
+struct BoundStr<'a> {
+    s: String,
+    _t: std::marker::PhantomData<&'a Token>,
+}
+
+struct PyStr(String);
+
+impl<'a> BoundStr<'a> {
+    fn new(_t: &'a Token, s: &str) -> Self {
+        BoundStr { s: s.to_string(), _t: std::marker::PhantomData }
+    }
+
+    /// The .into(): strip the lifetime, keep the data.
+    fn into_detached(self) -> PyStr {
+        PyStr(self.s)
+    }
+
+    /// Read the payload while still under the token.
+    fn read(&self) -> &str {
+        &self.s
+    }
+}
+
+/// Detach `payload` INSIDE `g`'s section and return the detached value.
+fn detach_inside(g: &Lock, payload: &str) -> PyStr {
+    todo!()
+}
+
+/// A guard standing in for Python's lock: work runs inside its sections.
+/// (Named Lock — §7's logging guard owns the name Gil.)
+struct Lock;
+impl Lock {
+    fn attach<T>(&self, f: impl FnOnce(&Token) -> T) -> T {
+        f(&Token)
+    }
+}
+
+// --- check (do not modify) ---
+let g = Lock;
+// the token never leaves the section...
+let detached = g.attach(|t| {
+    let b = BoundStr::new(t, "row0");
+    assert_eq!(b.read(), "row0");
+    b.into_detached()   // born under the token, detached before it ends
+});
+// ...but the detached value does: same string, no token in sight
+let handle = std::thread::spawn(move || detached.0.len());
+assert_eq!(handle.join().unwrap(), 4, "Py<T> crosses threads; the token does not");
+assert_eq!(detach_inside(&g, "row1").0, "row1");
+println!("Exercise 5.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 6. Calling Python from Rust
+
+Four verbs — **import, getattr, call, extract** — chained with `?`, every hop a `Result`. The mirror is a module registry whose errors carry Python's own wording.
+
+**See**: §6 of the example notebook.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 6.1 The four verbs against a registry.
+// Given: the registry and its errors — do not modify.
+struct Registry(std::collections::HashMap<String, std::collections::HashMap<String, String>>);
+
+#[derive(Debug, PartialEq)]
+enum CallError {
+    NoModule(String),
+    NoAttr(String),
+}
+
+impl std::fmt::Display for CallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CallError::NoModule(m) => write!(f, "No module named '{m}'"),
+            CallError::NoAttr(a) => write!(f, "module has no attribute '{a}'"),
+        }
+    }
+}
+
+impl Registry {
+    fn import(&self, name: &str) -> Result<&std::collections::HashMap<String, String>, CallError> {
+        self.0.get(name).ok_or_else(|| CallError::NoModule(name.to_string()))
+    }
+}
+
+fn getattr<'a>(
+    m: &'a std::collections::HashMap<String, String>,
+    attr: &str,
+) -> Result<&'a String, CallError> {
+    m.get(attr).ok_or_else(|| CallError::NoAttr(attr.to_string()))
+}
+
+/// The chain, spelled out: import `module`, getattr `attr`, "call" it
+/// (the registry's payload IS the reply) and "extract" its length. Any
+/// failure becomes the error's Display text.
+fn call_len(reg: &Registry, module: &str, attr: &str) -> Result<usize, String> {
+    todo!()
+}
+
+/// First link of the chain alone: import `module`, mapping the error to
+/// Python's wording.
+fn import_wording(reg: &Registry, module: &str) -> String {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let mut math = std::collections::HashMap::new();
+math.insert("sqrt".to_string(), "square-root".to_string());
+let reg = Registry(std::collections::HashMap::from([
+    ("math".to_string(), math),
+]));
+assert_eq!(call_len(&reg, "math", "sqrt"), Ok(11));
+assert_eq!(call_len(&reg, "numpy", "sqrt"),
+    Err("No module named 'numpy'".to_string()));
+assert_eq!(call_len(&reg, "math", "cosine"),
+    Err("module has no attribute 'cosine'".to_string()));
+assert_eq!(import_wording(&reg, "numpy"), "No module named 'numpy'");
+println!("Exercise 6.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 7. The GIL: Sections
+
+The lock is CPython's; the discipline is yours: Python-heap work under `attach`, the hot pure-Rust loop with the lock released, re-attach to use the results. The mirror times three sections with a section log.
+
+**See**: §7 of the example notebook.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 7.1 The attach/detach/re-attach sandwich, observed.
+// Given: the guard — do not modify.
+struct Gil {
+    log: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+}
+
+impl Gil {
+    fn new() -> Self {
+        Gil { log: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())) }
+    }
+
+    fn attach<T>(&self, tag: &'static str, f: impl FnOnce() -> T) -> T {
+        self.log.lock().unwrap().push(tag);
+        f()
+    }
+}
+
+/// Run the sandwich: inside attach("first", ..) produce 21, inside
+/// detach (NO attach — just compute) double it, inside attach("second",
+/// ..) add 21. Return the final value. The guard logs each section.
+fn sandwich(g: &Gil) -> i64 {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let g = Gil::new();
+assert_eq!(sandwich(&g), 63);
+assert_eq!(*g.log.lock().unwrap(), vec!["first", "second"],
+    "exactly two attach sections; the doubling ran released");
+println!("Exercise 7.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 8. Guided cdylib Tasks
+
+The kernel cannot load a Python extension, so these tasks run at the prompt — in `C:/Users/GSL/AppData/Local/Temp/spike20` (§0's desk), with the build loop `cargo build`, copy `target/debug/spike20.dll pytest/spike20.pyd`, `python -m pytest test_spike20.py -s`. Do each task in order; every one ends with a receipt to write down. (The probe module already contains everything below — read `src/lib.rs` alongside, and make each change yourself.)
+
+### Task 1 — a module from scratch
+
+Empty `src/lib.rs` completely, then rebuild it from nothing:
+
+    use pyo3::prelude::*;
+
+    #[pyfunction]
+    fn add(a: i64, b: i64) -> PyResult<i64> {
+        Ok(a + b)
+    }
+
+    #[pymodule]
+    fn spike20(m: &Bound<'_, PyModule>) -> PyResult<()> {
+        m.add_function(wrap_pyfunction!(add, m)?)?;
+        Ok(())
+    }
+
+Build, copy, and check `python -c "import spike20; print(spike20.add(19, 23))"` prints 42.
+
+Receipts to observe: the first build compiles pyo3 + syn/quote (~20 s); the second build is ~1 s. Now rename the module function to `deskmod` (leave the file `spike20.pyd`) and import again — CPython's importer calls the exported `PyInit_<name>`, and the name mismatch fails the import. Rename back.
+
+### Task 2 — the error bridge, by hand
+
+Add to the module (§3's level 2):
+
+    #[derive(Debug)]
+    struct Spill(String);
+
+    impl std::fmt::Display for Spill {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "spill: {}", self.0)
+        }
+    }
+    impl std::error::Error for Spill {}
+
+    impl From<Spill> for PyErr {
+        fn from(e: Spill) -> PyErr {
+            PyValueError::new_err(e.to_string())
+        }
+    }
+
+    #[pyfunction]
+    fn custom_error(n: i64) -> Result<i64, Spill> {
+        if n < 0 { Err(Spill(format!("negative {n}"))) } else { Ok(n * 2) }
+    }
+
+(remember `use pyo3::exceptions::PyValueError;`) and export it. From `pytest/`: `python -c "import spike20; print(spike20.custom_error(21)); spike20.custom_error(-3)"` — the first prints 42, the second raises `ValueError: spill: negative -3`.
+
+Now the experiment the probe caught first: change the `From` body to `PyValueError::new_err(e.0)` and rebuild. The message loses its `"spill: "` prefix — the From impl decides the payload; Display is applied only if you call it. Restore `e.to_string()`.
+
+### Task 3 — a class with a refusing setter
+
+Add §4's `Fill` (the full listing is in the example notebook) plus `m.add_class::<Fill>()?;` in the module fn. From `pytest/`:
+
+    python -i -c "import spike20; f = spike20.Fill('AAA', 100)"
+
+Then at the `>>>` prompt: `f.qty = 150` (the `#[pyo3(get, set)]` field), `f.notional()` (15000), `f.label` (`'AAAx150'`, the computed getter), and `f.label = 'no'` — which raises **`ValueError: label is read-only`**, not `AttributeError`: the setter's `Err` passes through verbatim, and only a *builtin* read-only attribute raises `AttributeError`. Exit with `quit()`.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 9. C Strings and the Debug Bound
+
+Two compile-time facts from the chapter, both kernel-honest: `Python::eval` takes a `&CStr` (the `c""` literal), and `std::error::Error` demands `Debug + Display`.
+
+**See**: §9 of the example notebook.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 9.1 The C-string shape and the two views of an error type.
+// Spill from §3.1 is in scope — items persist; redefining it would be E0428.
+
+/// The c-literal "6 * 7": how many bytes does it occupy INCLUDING its
+/// NUL terminator? (The number that makes &CStr different from &str.)
+fn c_total() -> usize {
+    todo!()
+}
+
+/// The same literal's bytes WITHOUT the terminator (to_bytes strips it).
+fn c_body() -> Vec<u8> {
+    todo!()
+}
+
+/// Both views of Spill("boom".to_string()): (Debug, Display) —
+/// Debug speaks double quotes; Display is the Python-visible payload.
+fn both_views() -> (String, String) {
+    todo!()
+}
+
+// --- check (do not modify) ---
+assert_eq!(c_total(), 6, "5 chars + the NUL");
+assert_eq!(c_body(), b"6 * 7".to_vec(), "to_bytes strips the terminator");
+assert_eq!(both_views(), ("Spill(\"boom\")".to_string(), "spill: boom".to_string()));
+println!("Exercise 9.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 10. Mixed Review
+
+Four problems, each from a different corner of the chapter.
+
+**See**: §0–§2 of the example notebook (10.1), §3 and §6 (10.2), §7 (10.3), §8 (10.4).
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 10.1 The boundary recipe, end to end: clip, error, price.
+
+/// Price a qty of i64 (unit 105, tax included): negative -> Err
+/// "bad qty {n}", else Ok(qty * 105).
+fn price(qty: i64) -> Result<i64, String> {
+    todo!()
+}
+
+// --- check (do not modify) ---
+assert_eq!(price(2), Ok(210));
+assert_eq!(price(0), Ok(0));
+assert_eq!(price(-1), Err("bad qty -1".to_string()));
+println!("Exercise 10.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 10.2 Registry + From: the two-hop error route.
+
+// Given: the boundary error — do not modify.
+#[derive(Debug, PartialEq)]
+struct DeskFail(String);
+
+/// Bridge a CallError into DeskFail through its Display — the error
+/// arrives speaking Python's wording.
+fn from_call(e: CallError) -> DeskFail {
+    todo!()
+}
+
+/// Route module/attr through `call_len` (§6.1's chain), converting the
+/// CallError through the bridge — the ? of a pyfunction with two hops.
+fn routed(reg: &Registry, module: &str, attr: &str) -> Result<usize, DeskFail> {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let mut math = std::collections::HashMap::new();
+math.insert("sqrt".to_string(), "square-root".to_string());
+let reg = Registry(std::collections::HashMap::from([
+    ("math".to_string(), math),
+]));
+assert_eq!(routed(&reg, "math", "sqrt"), Ok(11));
+assert_eq!(routed(&reg, "numpy", "sqrt"),
+    Err(DeskFail("No module named 'numpy'".to_string())));
+assert_eq!(routed(&reg, "math", "cosine"),
+    Err(DeskFail("module has no attribute 'cosine'".to_string())));
+println!("Exercise 10.2 passed");
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 10.3 Detach-map-attach: the hot map runs released.
+
+/// Apply `f` to every element of `xs` — the released section (the guard
+/// logs nothing there) — then collect the results under attach("second").
+/// Return the mapped values.
+fn released_map(g: &Gil, xs: &[i64], f: impl Fn(i64) -> i64) -> Vec<i64> {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let g = Gil::new();
+let out = released_map(&g, &[1, 2, 3], |x| x * 10);
+assert_eq!(out, vec![10, 20, 30]);
+assert_eq!(*g.log.lock().unwrap(), vec!["second"],
+    "exactly one attach section; the map ran with the lock released");
+println!("Exercise 10.3 passed");
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 10.4 The module inventory: the desk module, fully grown.
+
+/// Count the manifest: (functions, classes, exceptions). The manifest is
+/// §8's from-scratch module, fully grown — every receipt in the example
+/// notebook's §10 is one of these entries.
+fn inventory(items: &[(&str, &'static str)]) -> (usize, usize, usize) {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let items = [
+    ("add", "function"), ("greet", "function"), ("sum_list", "function"),
+    ("count_keys", "function"), ("maybe", "function"), ("pair_arg", "function"),
+    ("list_out", "function"), ("dict_out", "function"),
+    ("always_fails", "function"), ("custom_error", "function"), ("raise_desk", "function"),
+    ("Fill", "class"),
+    ("build_dict", "function"), ("build_list", "function"), ("build_tuple", "function"),
+    ("call_math_sqrt", "function"), ("eval_expr", "function"), ("attach_probe", "function"),
+    ("DeskError", "exception"),
+];
+assert_eq!(inventory(&items), (17, 1, 1), "spike20's real inventory");
+println!("Exercise 10.4 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 11. What Comes Next
+
+| Next | What it borrows from here |
+|---|---|
+| **21 — Capstone Prep** | the doc-reading discipline (maturin and setuptools-rust docs, CHANGELOGs, feature flags) aimed at packaging tools; §3's error handling across crate boundaries; §1's crossing costs become criterion benchmarks. |
+| **22 — Capstone** | the market-data service can ship its pricing kernel as a pyo3 module: `Fill`-shaped exports, PyErr bridges on every error path, the §8 loop as the release process. |
+
+Carry forward: **kernel exercises prove the shapes, the cdylib tasks prove the loop; signatures are contracts; errors cross as PyErr through From; Python objects are born under a token and travel detached.**
+</VSCode.Cell>

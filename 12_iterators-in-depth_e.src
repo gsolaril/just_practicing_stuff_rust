@@ -1,0 +1,876 @@
+<VSCode.Cell language="markdown">
+# Rust 112: Iterators in Depth
+
+Chapter 12 of the Rust track, and the chapter that names the machinery behind half the code you have already written. `for` loops over `Vec`s, `map` and `filter` chains, `collect` into everything from `Vec` to `HashMap` to `Result` — chapter 06 used them all as clients. This chapter crosses to the author's side: `Iterator` is a trait with **one required method** (`next`), everything else is a default method built on it, and every adaptor you have called — `map`, `filter`, `take`, `zip` — is a *type* that wraps your data and yields it lazily. The chapter closes the loop with chapter 10: iterators are the applied-track's running proof that traits plus generics beat inheritance.
+
+Everything here is a **runnable example**. Read the markdown, run the cell below it, and change nothing — the practice twin of this notebook is `12_iterators-in-depth_p.ipynb`.
+
+## Who this is written for
+
+You are assumed to be a competent programmer arriving from Python and C++. You have used generators, list comprehensions, and STL algorithms — none of that is new. What is new: Rust's iterator is **not a language feature** — no `yield`, no generator keyword; it is one trait, `fn next(&mut self) -> Option<Item>`, and the compiler *desugars* `for` loops into `while let Some(x) = it.next()` on top of it. Python's comprehension pipeline builds lists eagerly (or `map` objects lazily but typelessly); C++20 ranges look similar but arrive with template-error pain; Rust's chains are lazy, typed at every hop, and compiled to the same machine code as the hand-written loop — when the adaptor count is fixed, zero-cost.
+
+## How to read this notebook
+
+- Markdown cells explain; code cells demonstrate. **Run each code cell as you reach it.** Cells are independent — no sandbox, no files touched, so restart-and-run-from-the-top always works.
+- Code that intentionally *fails* is shown as a comment, together with the diagnostic you would get. §10 is the catalogue.
+- The `Ticks` iterator from §2 stays live for the rest of the notebook — §3's `size_hint`, §7's `DoubleEndedIterator` and §8's allocation measurements all reuse it.
+- The prose is terse and the facts are dense. This is a reference you will come back to, not a novel you read once.
+
+## The one idea to internalise
+
+**An iterator is a state machine; a chain is a state machine made of state machines.** `next` is the whole protocol: pull, and you get `Some(item)` or the final `None`. Adaptors do not run anything — they wrap the upstream iterator so that *their* `next` pulls *your* `next`; consumers drive the pump by calling `next` until `None`. That single shape explains laziness (nothing pulls, nothing runs), short-circuiting (`any` stops pulling), the allocation story (`collect` sizes the sink), and why the compiler can flatten a five-hop chain into one loop: every hop is inlinable `next` calls around one mutable cursor.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+### Contents
+
+- [0. Notebook Conventions: How These Cells Run](#0-notebook-conventions-how-these-cells-run)
+- [1. The Trait: One Required Method](#1-the-trait-one-required-method)
+- [2. A Custom Iterator from Scratch](#2-a-custom-iterator-from-scratch)
+- [3. Adaptors vs Consumers](#3-adaptors-vs-consumers)
+- [4. Laziness and Short-Circuiting](#4-laziness-and-short-circuiting)
+- [5. `collect`: The Fan-Out](#5-collect-the-fan-out)
+- [6. `for` Loops and the Three Iterators](#6-for-loops-and-the-three-iterators)
+- [7. Beyond `next`: `fold`, `try_fold` and Friends](#7-beyond-next-fold-try-fold-and-friends)
+- [8. Returning Iterators: `impl Iterator`](#8-returning-iterators-impl-iterator)
+- [9. Rolling Your Own Adaptor](#9-rolling-your-own-adaptor)
+- [10. Reading the Compiler: E-Codes](#10-reading-the-compiler-e-codes)
+- [11. The Cost Model](#11-the-cost-model)
+- [12. Mental Model: The Pump](#12-mental-model-the-pump)
+- [13. Cheat Sheet](#13-cheat-sheet)
+- [14. Review](#14-review)
+
+If you are returning to this chapter later, §13 is the one-page summary, §10 the diagnostics catalogue, and §11 the cost numbers.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 0. Notebook Conventions: How These Cells Run
+
+This notebook runs on the **evcxr** kernel, which wraps each cell into a generated program and compiles it incrementally. Three consequences matter for every cell below:
+
+- **There is no `fn main`.** The kernel supplies one; you are typing its body.
+- **State persists across cells.** A `let` from cell 4 is still live in cell 20 — including `use` statements.
+- **Items are order-independent, statements are not.** Two `fn`s may call each other regardless of order; two `let`s may not use each other's names before they run.
+
+There is **one namespace per notebook**. Two items with the same name collide exactly as they would in one source file, even in different sections. This chapter *defines iterator types*, so the rule gets sharper: every `struct`, `trait` and `impl` name below is unique across the whole notebook. If you re-run a cell that defines an item, it is redefined; on a redefinition error, restart the kernel and run from the top.
+
+A failing cell does not poison the kernel — the deliberate compile errors in this chapter are comments, so every cell still runs.
+
+### A chapter with timing cells
+
+Like chapter 10's dispatch measurements, two cells here (§4.2, §11.1) print *timings*. The absolute numbers wander run to run; the assertions pin only the structural facts (short-circuit beats full traversal; one-allocation collect), never a ratio.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 0.1 Smoke test: pull, then drain — the chapter's whole protocol in one line.
+let mut it = vec![10, 20, 30].into_iter();
+assert_eq!(it.next(), Some(10));
+assert_eq!(it.count(), 2); // count() drains the rest: 20, 30
+let mut empty = std::iter::empty::<i32>();
+assert_eq!(empty.next(), None);
+println!("kernel alive: next() drives everything");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 1. The Trait: One Required Method
+
+The whole abstraction is four lines long:
+
+```rust
+pub trait Iterator {
+    type Item;
+    fn next(&mut self) -> Option<Self::Item>;
+    // 70+ default methods follow: map, filter, take, zip, collect, sum, ...
+}
+```
+
+`type Item` names what the iterator yields; `next` returns `Some(item)` each pull and `None` forever after. Every other method the trait offers is a **default method**: `map` builds a `Map<Self, F>` struct around your iterator, `take` builds a `Take<Self>`, and so on. Two consequences follow, and they are the chapter:
+
+| Consequence | Why |
+|---|---|
+| adaptors are **lazy** | a `Map` is just a struct; nothing runs until a consumer pulls |
+| chains are **types** | `(0..10).map(f).filter(g)` has type `Filter<Map<Range<i32>, F>, G>` — composable, nameable, optimisable |
+
+The `Option` return is chapter 05's `Option` doing protocol duty: iteration ends by *returning a value*, not by raising, not by unwinding — and `next` on a finished iterator must keep returning `None` (the contract that `FusedIterator` marks, §2).
+
+### The protocol, exercised by hand
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 1.1 next() by hand: the loop you never see, written out.
+let prices = vec![10.0, 20.0, 30.0];
+let mut it = prices.iter(); // Iterator with Item = &f64
+assert_eq!(it.next(), Some(&10.0));
+assert_eq!(it.next(), Some(&20.0));
+assert_eq!(it.next(), Some(&30.0));
+assert_eq!(it.next(), None);
+assert_eq!(it.next(), None); // finished iterators stay finished
+// the for-loop desugar: exactly this, plus the None arm breaking the loop
+let mut total = 0.0;
+let mut it = prices.iter();
+while let Some(&px) = it.next() {
+    total += px;
+}
+assert_eq!(total, 60.0);
+// IntoIterator is the trait `for` actually asks for (section 6):
+let sum: f64 = prices.into_iter().sum();
+assert_eq!(sum, 60.0);
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+Note the receiver: `next(&mut self)` — iteration *mutates the iterator*, which is why iterators live in `let mut` bindings and why a chain cannot be shared across threads without care (chapter 16's `Send`/`Sync` story). `while let Some(..) = it.next()` is the desugar the language performs for `for x in it` — with one addition: `for` calls `into_iter()` first (§6), converting whatever it is given into an iterator.
+
+## 2. A Custom Iterator from Scratch
+
+Because the trait needs exactly one method, a bespoke iterator is twenty lines — and it is the clearest way to see what adaptors really are. The running example for the rest of the chapter: `Ticks`, a synthetic price generator yielding `Px` values on a stride:
+
+| Piece | Job |
+|---|---|
+| `struct Ticks { next, end, step }` | the state machine's cursor |
+| `impl Iterator for Ticks` | `next` = advance cursor, emit `Some(Px)` or `None` |
+| `impl FusedIterator for Ticks` | promise: after the first `None`, always `None` |
+| `fn size_hint` override | `(lower, upper)` — "exactly n left" |
+
+`FusedIterator` is a **marker trait** (chapter 10's unit-struct pattern again): it adds no methods, only a promise that lets downstream code skip re-checking for repeated `None`. Most std iterators are fused; `next` returning `Some` again after `None` is legal but deprecated behaviour. The empty `impl FusedIterator for Ticks {}` is the same fact-not-stub pattern as `impl Error for FeedError {}` in chapter 11.
+
+### The cursor, the trait, the marker, the hint
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 2.1 A custom iterator: one struct, one next, one marker impl.
+use std::iter::FusedIterator;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Px(u32);
+
+struct Ticks {
+    next: u32, // the cursor
+    end: u32,
+    step: u32,
+}
+impl Ticks {
+    fn new(start: u32, end: u32, step: u32) -> Self {
+        Ticks { next: start, end, step }
+    }
+}
+impl Iterator for Ticks {
+    type Item = Px;
+    fn next(&mut self) -> Option<Px> {
+        if self.next < self.end {
+            let out = Px(self.next);
+            self.next += self.step;
+            Some(out)
+        } else {
+            None
+        }
+    }
+    // the length contract, overridden: "exactly n items remain"
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        if self.next < self.end {
+            let n = (((self.end - self.next) + self.step - 1) / self.step) as usize;
+            (n, Some(n))
+        } else {
+            (0, Some(0))
+        }
+    }
+}
+impl FusedIterator for Ticks {} // the promise: once None, always None
+
+// the three ways to drive it:
+let mut t = Ticks::new(0, 10, 3);
+assert_eq!(t.next(), Some(Px(0)));
+assert_eq!(t.next(), Some(Px(3)));
+assert_eq!(t.next(), Some(Px(6)));
+assert_eq!(t.next(), Some(Px(9)));
+assert_eq!(t.next(), None);
+let ys: Vec<u32> = Ticks::new(0, 10, 3).map(|p| p.0).collect();
+assert_eq!(ys, vec![0, 3, 6, 9]);
+let mut seen = 0;
+for _p in Ticks::new(0, 6, 2) {
+    seen += 1; // `for` needs nothing beyond the Iterator impl
+}
+assert_eq!(seen, 3);
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+Three reads on that cell. **The cursor is the iterator**: `Ticks` holds no data, only position — the same shape as every std iterator (`slice::Iter` holds a pointer pair; `Range` holds two integers; `Take<I>` holds an inner iterator plus a counter). **`for _p in Ticks::new(..)` works with no extra traits** because `for` only asks for `Iterator` (via `IntoIterator`, and every `Iterator` is trivially `IntoIterator` into itself — §6). **Adaptors compose on it for free**: `Ticks::new(0, 10, 3).map(|p| p.0).collect()` needed nothing from us — `map`'s `Map<Ticks, F>` implements `Iterator` *because* `Ticks` does, a blanket impl in std's favour.
+
+One thing this iterator does *not* support, deliberately: `.rev()`. Reverse iteration is a second trait — `DoubleEndedIterator` with its `next_back` — and §7 wires it in.
+
+### `size_hint`: the length contract, read
+
+`Iterator::size_hint` returns `(lower, upper)` — how many items remain, at least and at most. Its real job is feeding `collect`: when `upper == lower`, `Vec::collect` allocates **exactly once** with the right capacity (§11). The default is `(0, None)` — "no idea" — which is why unknown-length iterators allocate on a growth curve instead. `Ticks` overrides it with the exact remaining count (the `size_hint` in §2.1's impl), which upgrades the type to **`ExactSizeIterator`** — the trait whose `len()` is a hint read:
+
+### The exact-length contract, exercised
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 2.2 size_hint and len: the collect machinery reads the same numbers you can.
+impl ExactSizeIterator for Ticks {} // legal: size_hint is exact
+
+let mut t = Ticks::new(0, 10, 3);
+assert_eq!(t.size_hint(), (4, Some(4))); // 0, 3, 6, 9 remain
+assert_eq!(t.len(), 4); // ExactSizeIterator's default method reads the hint
+assert_eq!(t.next(), Some(Px(0)));
+assert_eq!(t.size_hint(), (3, Some(3))); // the cursor moved, the hint followed
+assert_eq!(t.count(), 3); // count() drains: it IS the hint, proven
+assert_eq!(Ticks::new(0, 10, 3).last(), Some(Px(9))); // last() also drains
+// an iterator that LIES (hint says 3, yields 5) still collects safely -
+// collect falls back to growth - but std's Vec::collect trusts exact hints
+// to allocate once; the measured proof is section 11.
+let drained = Ticks::new(0, 0, 1);
+assert_eq!(drained.len(), 0); // the empty range, honestly hinted
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+`ExactSizeIterator` is a marker-plus-one: one default method (`len()`), no new obligations beyond "the hint's upper bound is the truth". The two consumers of that truth are `collect` (allocate once, §11) and code that needs `len()` on any `impl ExactSizeIterator` — including every slice iterator. An iterator that lies does not corrupt memory — `collect` falls back gracefully — but a too-large guess wastes and a too-small one re-grows, which is why the honest override in §2.1 is worth its seven lines.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 3. Adaptors vs Consumers
+
+The 70+ default methods sort into two families, and the sort is the whole API:
+
+| Family | Signature shape | Runs immediately? | Examples |
+|---|---|---|---|
+| **adaptor** | `fn map<B, F>(self, f: F) -> Map<Self, F>` — returns an iterator | no — a struct wrap | `map`, `filter`, `take`, `skip`, `zip`, `enumerate`, `rev`, `filter_map` |
+| **consumer** | `fn sum<S>(self) -> S` — returns a value | yes — drives `next` to the end | `collect`, `sum`, `count`, `max`, `find`, `any`, `all`, `fold` |
+
+The two rules that follow, in the order you will break them:
+
+1. **An adaptor consumes `self`** — `v.iter()` produces an iterator *borrowing* `v`; `map` then consumes that iterator, not `v`. But `v.into_iter().map(..)` consumes `v` itself: after the chain, `v` is moved (E0382 on first use, §6.2).
+2. **Nothing happens until a consumer runs** — a bare `(0..5).map(|x| x * 2);` compiles but does nothing except produce a value nobody drives. The compiler warns (`unused_must_use`) because *every* adaptor returns a "must use" value: the pipeline is the value.
+
+Adaptors are consumed one at a time — `iter.map(a).map(b)` needs the intermediate binding or a one-liner; you cannot call `.map` twice on the *same* iterator value. That is the ownership rule, not a limitation: each hop takes the previous state machine by value and returns a bigger one.
+
+### The two families, exercised
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 3.1 Adaptors wrap; consumers drive. Same pipeline, both halves shown.
+let v = vec![1, 2, 3, 4, 5];
+// adaptors: nothing has run yet, the chain is a value:
+let evens_then_double = v.iter().filter(|x| *x % 2 == 0).map(|x| x * 10);
+// ...and the chain is itself an iterator - hand-driving it works:
+let mut chain = evens_then_double;
+assert_eq!(chain.next(), Some(20)); // 2 -> 20
+assert_eq!(chain.next(), Some(40)); // 4 -> 40
+assert_eq!(chain.next(), None);
+// consumers: each of these drains a fresh chain:
+assert_eq!(v.iter().filter(|x| *x % 2 == 0).map(|x| x * 10).sum::<i32>(), 60);
+assert_eq!(v.iter().max(), Some(&5));
+assert_eq!(v.iter().count(), 5);
+assert_eq!(v.iter().find(|&&x| x > 3), Some(&4)); // short-circuits (4.2)
+// the must-use warning on a bare adaptor:
+// (0..5).map(|x| x * 2);            // warning: unused `Map` that must be used
+let _ = (0..5).map(|x| x * 2);       // the `let _ =` idiom keeps it silent
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+The hand-driven `chain` binding is the picture worth keeping: a three-part pipeline is one struct implementing `Iterator`, and `next` on it walks the whole assembly — `Filter`'s next pulls `slice::Iter`'s next, applies the predicate, repeats until the predicate passes; then `Map` transforms. One cursor, many wrappers, zero boxes (§11 has the numbers).
+
+### The adaptor shelf
+
+| Adaptor | Gives | Note |
+|---|---|---|
+| `map(f)` | one transformed item per item | the workhorse |
+| `filter(p)` | items passing `p` | `p: &Item` — a reference, chapter 05's rule |
+| `filter_map(f)` | `Option`-returning `f`, `None` dropped | filter + map in one pull |
+| `take(n)` / `skip(n)` | first n / all but first n | `take` makes infinite sources safe |
+| `enumerate()` | `(index, item)` pairs | the `for`-counter, iterator-style |
+| `zip(other)` | pairs pulled from both | ends when *either* ends |
+| `flatten()` / `flat_map(f)` | one level of nesting removed | `flat_map` = map then flatten |
+| `rev()` | backwards | needs `DoubleEndedIterator` (§7) |
+| `chunks(n)` / `windows(n)` | slices of the source | slice iterators only (§4.3) |
+| `inspect(f)` | the items, untouched, `f` runs | the pipeline's `println!` |
+
+### The shelf, exercised
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 3.2 The adaptor shelf: one chain per row, everything asserted.
+use std::collections::HashMap;
+// filter_map: parse what parses, drop the rest (ch11's ok() pattern, piped)
+let parsed: Vec<u32> = ["10", "x", "30"].iter().filter_map(|s| s.parse().ok()).collect();
+assert_eq!(parsed, vec![10, 30]);
+// enumerate: index and item in one pass
+let tagged: Vec<(usize, u32)> = (0..3).enumerate().map(|(i, x)| (i, x * x)).collect();
+assert_eq!(tagged, vec![(0, 0), (1, 1), (2, 4)]);
+// zip: ends when either side ends; pairs into a map via collect (5)
+let m: HashMap<&str, f64> = ["ES", "NQ"].iter().copied().zip([4126.5, 15000.0]).collect();
+assert_eq!(m.len(), 2);
+// flatten and flat_map: one level of nesting disappears
+let flat: Vec<i32> = vec![vec![1, 2], vec![3]].into_iter().flatten().collect();
+assert_eq!(flat, vec![1, 2, 3]);
+let fanned: Vec<i32> = (1..=3).flat_map(|x| [x, x * 10]).collect();
+assert_eq!(fanned, vec![1, 10, 2, 20, 3, 30]);
+// inspect: a window into the pipeline, items untouched
+let seen = (0..4).inspect(|x| { let _ = x; }).filter(|x| x % 2 == 0).sum::<i32>();
+assert_eq!(seen, 2);
+// skip and take compose into pagination:
+let page2: Vec<u32> = (0..10).skip(4).take(3).collect();
+assert_eq!(page2, vec![4, 5, 6]);
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+Two shelf rows deserve their own paragraphs. **`filter` takes `&Item`** — the predicate receives `&&i32` when the item is already a reference, and the closure signature `|x: &&i32| **x % 2 == 0` in that cell's first chain is the deref ladder paying off; chapter 05's rule (pattern matching *copies out*) is what makes `|&x|` the idiomatic form. **`zip` with an infinite side** (`repeat`, `cycle`) is the standard "pair each element with a counter" trick — `repeat("x").zip(1..=3)` ends with the finite side, and `take` is the safety belt for genuinely infinite pipelines.
+
+## 4. Laziness and Short-Circuiting
+
+Laziness is not a style choice; it is *what an adaptor is* — a struct waiting to be pulled. The proof is a side-effect counter: a `map` closure that increments a shared counter runs **zero times** until a consumer arrives, then **exactly once per yielded item**. The counter is an `Rc<Cell<usize>>` — shared mutable state that survives the closure capture (chapter 14 owns the full tour; here `Cell` just needs to be copyable inside a borrowing closure).
+
+### The laziness proof
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 4.1 Laziness, proven: the closure does not run until the consumer runs.
+use std::cell::Cell;
+use std::rc::Rc;
+let calls = Rc::new(Cell::new(0usize));
+let counter = calls.clone();
+let mapped = (0..5).map(move |x| {
+    counter.set(counter.get() + 1);
+    x * 2
+});
+println!("after .map():  closure calls = {}", calls.get());
+assert_eq!(calls.get(), 0); // nothing has run
+let doubled: Vec<i32> = mapped.collect();
+println!("after collect: closure calls = {}", calls.get());
+assert_eq!(calls.get(), 5); // exactly once per item
+assert_eq!(doubled, vec![0, 2, 4, 6, 8]);
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+Three states in one cell: zero calls after building the chain, five after the consumer. The third state is **early drop**: drop an unconsumed chain and the count stays zero — destructors run, closures never do. Together they are the operational definition of lazy.
+
+### Short-circuiting: consumers that stop pulling
+
+Consumers decide when to stop calling `next`. `find`, `any`, `all`, `position` stop at the first item that answers the question; `take(n)` stops after n. On a million-item source, "does any element exceed 3?" finishes in nanoseconds because the pull loop halts at element 4:
+
+### The timing shape of a short circuit
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 4.2 Short-circuit: any() stops pulling; a full sum cannot.
+use std::time::Instant;
+let big: Vec<u32> = (0..100_000_000).collect();
+let t0 = Instant::now();
+let found = big.iter().any(|&x| x > 3); // stops at the 4th element
+let dt_any = t0.elapsed();
+let t0 = Instant::now();
+let total: u64 = big.iter().map(|&x| x as u64).sum(); // must see everything
+let dt_sum = t0.elapsed();
+println!("any(): {dt_any:?} vs sum(): {dt_sum:?} (total {total})");
+assert!(found);
+assert!(dt_any < dt_sum); // structural, not a ratio: halt beats full drain
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+The assertion pins structure, not speed — ratios wander (chapter 10's dispatch lesson), but "a halt beats a full traversal" is definitional. The design habit falls out: **put cheap filters early in the chain** — `filter(p).map(expensive)` never runs `expensive` on rejected items, because `Map`'s `next` is only ever called from downstream, and downstream stopped pulling.
+
+### Slices are iterators: `chunks` and `windows`
+
+Two slice-only views earn a cell because they answer different questions and are endlessly confused:
+
+| | `chunks(n)` | `windows(n)` |
+|---|---|---|
+| semantics | disjoint blocks | sliding pane, stride 1 |
+| tail behaviour | last chunk may be shorter | none — panics if `n > len` |
+| count for len `k`, size `n` | `ceil(k / n)` | `k - n + 1` |
+
+### The two slice views
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 4.3 chunks vs windows on the same seven candles.
+let data: Vec<i32> = (1..=7).collect();
+let blocks: Vec<Vec<i32>> = data.chunks(3).map(|c| c.to_vec()).collect();
+assert_eq!(blocks, vec![vec![1, 2, 3], vec![4, 5, 6], vec![7]]); // ragged tail kept
+let panes: Vec<Vec<i32>> = data.windows(3).map(|w| w.to_vec()).collect();
+assert_eq!(panes.len(), 5); // 7 - 3 + 1
+let sums: Vec<i32> = data.windows(2).map(|w| w[0] + w[1]).collect();
+assert_eq!(sums, vec![3, 5, 7, 9, 11, 13]); // 7 - 2 + 1 = 6 panes
+// the shortest-moving-average idiom, one window wide:
+let ma: f64 = data.iter().as_slice().windows(3)
+    .map(|w| w.iter().sum::<i32>() as f64 / 3.0)
+    .last()
+    .unwrap();
+assert_eq!(ma, 6.0); // (5 + 6 + 7) / 3
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+`chunks` keeps the ragged tail (empty `v` gives zero chunks; a 7-element slice at width 3 gives `[1,2,3], [4,5,6], [7]`), `windows` panics if the pane exceeds the slice — the diagnostics are chapter 06's container panics again, now in iterator vocabulary. Both yield **slices** (`&[T]`), so the item is already a view; `windows(2).map(|w| w[0] + w[1])` is the moving-sum idiom from this cell, and the empty-slice corner (`windows(3)` on `[]`) is the panic to guard before shipping.
+
+## 5. `collect`: The Fan-Out
+
+`collect` is the most general consumer — and the most magical until you read its signature:
+
+```rust
+fn collect<B: FromIterator<Self::Item>>(self) -> B
+```
+
+**`FromIterator` is the trait of "buildable from an iterator"** — `Vec<T>`, `String`, `HashMap<K, V>`, `HashSet<T>`, `BTreeMap`, `VecDeque` all implement it, and *so do `Result<Vec<T>, E>` and `Option<Vec<T>>`*. That last line is the magic explained: collecting `Result<Vec<u32>, _>` walks the chain, short-circuits on the first `Err`, and returns it — the "parse every row or fail fast" pattern, no loop required. `FromIterator` for `Result` short-circuits exactly like `?` (chapter 11's hop, consumer edition).
+
+### The target zoo
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 5.1 collect into everything: the target zoo, one chain per target.
+use std::collections::{BTreeMap, HashSet};
+let v: Vec<u32> = (1..4).map(|x| x * 10).collect();
+let v2 = Vec::from_iter((1..4).map(|x| x * 10)); // the same thing, function form
+let s: String = "prices".chars().collect();
+let hs: HashSet<u32> = vec![1, 2, 2, 3].into_iter().collect();
+let bm: BTreeMap<char, usize> = "book".chars().map(|c| (c, c as usize)).collect();
+assert_eq!(v, vec![10, 20, 30]);
+assert_eq!(v2, v);
+assert_eq!(s, "prices");
+assert_eq!(hs.len(), 3); // the duplicate collapsed
+assert_eq!(bm[&'b'], 98usize); // BTreeMap<char, _> indexes by &char
+println!("zoo: Vec, Vec::from_iter, String, HashSet, BTreeMap all from FromIterator");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+`Vec::from_iter(chain)` and `let v: Vec<_> = chain.collect();` are the same call — the function form is just the turbofish with the annotation moved into the callee, and it reads better in function-argument position. The reverse trait exists too: `IntoIterator` (§6) is "give me an iterator", `FromIterator` is "an iterator builds me" — the pair that makes chains compose in both directions.
+
+### The two collects that stop early
+
+`Result` and `Option` implement `FromIterator` with the fail-fast rule: first `Err`/`None` wins and the rest is never pulled.
+
+### The fail-fast collect
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 5.2 collect into Result/Option: the fallible fan-out.
+let rows = vec!["10", "20", "30"];
+let parsed: Result<Vec<u32>, _> = rows.iter().map(|r| r.parse::<u32>()).collect();
+assert_eq!(parsed, Ok(vec![10, 20, 30]));
+let bad = vec!["10", "x", "30"];
+let failed: Result<Vec<u32>, _> = bad.iter().map(|r| r.parse::<u32>()).collect();
+println!("first error: {failed:?}");
+let first = failed.unwrap_err();
+assert!(first.to_string().contains("invalid digit"));
+let opts: Option<Vec<u32>> = vec![Some(1), Some(2)].into_iter().collect();
+let none: Option<Vec<u32>> = vec![Some(1), None].into_iter().collect();
+assert_eq!(opts, Some(vec![1, 2]));
+assert_eq!(none, None);
+// the chapter-11 bridge, one line: collect + ? composes with FromError-free glue
+fn all_u32(rows: &[&str]) -> Result<Vec<u32>, std::num::ParseIntError> {
+    rows.iter().map(|r| r.parse::<u32>()).collect()
+}
+assert_eq!(all_u32(&["7", "8"]), Ok(vec![7, 8]));
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+`Result<Vec<u32>, _>` is the idiom to memorise: the `_` is the error type, inferred — here `ParseIntError` from `str::parse`. This is also the honest answer to "how do I early-return from a loop in a function returning `Result`": build the fallible chain, `collect`, and let `?` carry it — chapter 13's test functions and chapter 17's HTTP plumbing both lean on this shape constantly. One boundary from chapter 11 restated: the reverse conversion does not exist — an `Err` cannot become a `None` *with the error preserved*, which is why `collect::<Option<..>>` discards the error and `Result` is the default target for fallible chains.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 6. `for` Loops and the Three Iterators
+
+`for x in collection` is syntax over a *second* trait. The loop asks its operand for `into_iter()`, then desugars to `next` pulls:
+
+```rust
+for x in v { body }                    // what you write
+let mut it = IntoIterator::into_iter(v); // what it means
+while let Some(x) = it.next() { body }
+```
+
+**`IntoIterator`** is the "give me an iterator" conversion trait, and every collection implements it *three ways* — which is why chapter 06 kept distinguishing `iter()`, `iter_mut()`, `into_iter()`:
+
+| Form | Yields | The collection afterwards |
+|---|---|---|
+| `v.iter()` | `&T` | untouched — borrowed |
+| `v.iter_mut()` | `&mut T` | mutated in place — mutably borrowed |
+| `v.into_iter()` | `T` | **moved** — gone (E0382 on first use) |
+| `for x in &v` | `&T` | sugar for `v.iter()` |
+| `for x in &mut v` | `&mut T` | sugar for `v.iter_mut()` |
+| `for x in v` | `T` | sugar for `v.into_iter()` |
+
+`for` *consumes what you give it* — the ampersand is the decision. Arrays and ranges are `IntoIterator` too (`for x in [1, 2, 3]` yields `i32` by value since edition 2021; `for x in 0..3` iterates the range directly), and `Iterator` itself implements `IntoIterator` trivially — into itself — which is why `for x in (0..3).map(f)` just works.
+
+### The three forms, and the E0382 that sorts them
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 6.1 iter / iter_mut / into_iter: same collection, three yields.
+let mut v = vec![10, 20, 30];
+let borrowed: Vec<&i32> = v.iter().collect();
+assert_eq!(borrowed, vec![&10, &20, &30]);
+for x in &mut v {
+    *x += 1; // in place: no reallocation, no move
+}
+assert_eq!(v, vec![11, 21, 31]);
+let owned: Vec<i32> = v.into_iter().map(|x| x * 2).collect();
+assert_eq!(owned, vec![22, 42, 62]);
+// println!("{v:?}"); // error[E0382]: borrow of moved value: `v`
+//   `v` moved due to this method call, in `v.into_iter()` (IntoIterator for Vec)
+// the borrowing rebuild, when the owned form is wanted but v must survive:
+let v2 = vec![String::from("a"), String::from("b")];
+let lens: Vec<usize> = v2.iter().map(|s| s.len()).collect(); // borrows
+assert_eq!(lens, vec![1, 1]); // v2 alive: the chain only read it
+assert_eq!(v2.len(), 2);
+let joined: String = v2.into_iter().collect(); // consumes
+assert_eq!(joined, "ab");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+The rule that saves re-reads of this section: **`map(|s| s.len())` over `iter()` can only *read*** — every item is a `&String`, so moving the `String` out is refused (E0507, §10) and `into_iter` is the *only* form that hands you owned items to transform destructively. When the transformation is arithmetic (`*2` on `i32`), `Copy` makes all three forms equivalent in effect — the difference is only what happens to the source.
+
+### `iter_mut` and the enumerate zip
+
+In-place mutation with index access composes `iter_mut` with `enumerate` — the idiom that replaces the C-style indexed loop:
+
+### The indexed in-place loop, iterator-style
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 6.2 iter_mut + enumerate: the indexed mutation idiom.
+let mut px = vec![100.0, 101.0, 102.0];
+for (i, p) in px.iter_mut().enumerate() {
+    *p *= 1.0 + (i as f64) / 100.0; // index-aware in-place update
+}
+assert_eq!(px.len(), 3);
+assert!(px[0] >= 100.0 && px[2] > px[0]); // i=0 scales by 1.0 exactly
+// and the two-sided zip with iter_mut for pairing a source with its slots:
+let mut slots = vec![0.0; 3];
+let rates = [0.1, 0.2, 0.3];
+for (slot, rate) in slots.iter_mut().zip(rates) {
+    *slot = 100.0 * (1.0 + rate);
+}
+assert_eq!(slots[2], 130.0);
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+`slots.iter_mut().zip(rates)` pairs mutable destinations with read-only inputs — no index arithmetic, no bounds checks, no borrow conflicts: `iter_mut` holds the only borrow of `slots`, `rates` is a separate `Copy` array, and `zip` ends at whichever is shorter. This is the shape chapter 16's parallel iterators will generalise, and it is the honest answer to "where did my indexed `for` go": into a zip.
+
+## 7. Beyond `next`: `fold`, `try_fold` and Friends
+
+`next` is the protocol, but the *consumers* you will actually write are built on two primitives: `fold` (the general accumulation) and `try_fold` (the fallible one — chapter 11's `?`, consumer edition).
+
+| Consumer | Shape | Gives |
+|---|---|---|
+| `fold(init, f)` | `f(acc, item) -> acc` | any accumulation, left to right |
+| `try_fold(init, f)` | `f(acc, item) -> Result<acc, E>` | short-circuits on `Err` |
+| `sum()` / `product()` | `fold` special cases | the arithmetic family |
+| `max()` / `min()` | comparison | `Option<Item>` — `None` only when empty |
+| `position(p)` / `find(p)` | search | `Option<usize>` / `Option<Item>`, short-circuit |
+| `fold` with `String` | text building | the `format!`-free concat |
+
+`fold` is worth one paragraph of respect: it is *every* array-reduce you know, with the accumulator's type explicit. `sum` is `fold(0, |a, x| a + x)` with the zero spelled by `Sum`; `"a".chars().fold(String::new(), |mut s, c| { s.push(c); s })` builds text one char at a time; chapter 10's `charge` (a `Cents` sum over a `fold`) was this method.
+
+### `fold` and its special cases
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 7.1 fold: the accumulator you control; sum/product as its special cases.
+let px = [4126.5, 4127.0, 4125.5];
+let avg = px.iter().sum::<f64>() / px.len() as f64;
+assert!((avg - 4126.333333333333).abs() < 1e-6); // f64: compare with a tolerance
+let product: f64 = px.iter().copied().take(2).product();
+assert_eq!(product, 4126.5 * 4127.0);
+// fold building a String without format! in the loop:
+let tick = "ES".chars().fold(String::new(), |mut s, c| {
+    s.push(c);
+    s
+});
+assert_eq!(tick, "ES");
+// fold into a tuple: running min AND max in one pass, with prose names via destructuring
+let (lo, hi) = px.iter().fold((f64::MAX, f64::MIN), |(lo, hi), p| ((*p).min(lo), (*p).max(hi)));
+assert_eq!((lo, hi), (4125.5, 4127.0));
+// fold's step can see the accumulated state - map cannot. The pair-wise idiom:
+// zip(it, it.skip(1)) remembers the previous item, so fold computes the widest step.
+let biggest_step = px
+    .iter()
+    .copied()
+    .zip(px.iter().copied().skip(1)) // consecutive pairs
+    .map(|(a, b)| b - a)             // steps: +0.5, -1.5
+    .fold(0.0_f64, f64::max);        // seed 0.0: the widest UP move wins
+assert_eq!(biggest_step, 0.5);
+assert_eq!(px.iter().copied().max_by(|a, b| a.partial_cmp(b).unwrap()), Some(4127.0));
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+The `(lo, hi)` fold is the pattern to steal: **fold carries arbitrary state between steps** — a `(lo, hi)` pair here, a running average elsewhere — while `map` is stateless per item by contract. When a pipeline seems to need "remember the previous item", the answer is almost always `fold` (or `zip(it, it.skip(1))`, the pair-wise idiom).
+
+### `try_fold`: the fallible accumulation
+
+`try_fold` is `fold` whose closure returns `Result` — and the consumer stops pulling at the first `Err`. Chapter 11's checked arithmetic, iterator edition:
+
+### The checked accumulation
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 7.2 try_fold: sum with checked arithmetic, short-circuit on overflow.
+let xs = [1u64, 2, 3, 4];
+let total: Result<u64, &str> = xs.iter().try_fold(0u64, |acc, x| {
+    acc.checked_add(*x).ok_or("overflow")
+});
+assert_eq!(total, Ok(10));
+let huge = [u64::MAX, 1];
+let trapped: Result<u64, &str> = huge.iter().try_fold(0u64, |acc, x| {
+    acc.checked_add(*x).ok_or("overflow")
+});
+assert_eq!(trapped, Err("overflow"));
+// the same shape across chapter-11 Result hops - parse-accumulate:
+let raws = ["10", "20"];
+let parsed_sum: Result<u64, std::num::ParseIntError> =
+    raws.iter().map(|r| r.parse::<u64>()).try_fold(0u64, |acc, v| Ok(acc + v?));
+assert_eq!(parsed_sum, Ok(30));
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+`try_fold` returns `Result<Acc, E>` — either the finished accumulator or the first error. The `map(..).try_fold(..)` composition in the last block is the loop body chapter 13's tests and chapter 17's streaming parses will keep writing: **pull, fall, stop**. Note what it replaces: a `for` loop with a `?` inside has the same semantics but cannot be chained with adaptors *before* it, and carries no `size_hint` for the reader — the iterator form keeps the pipeline composable to the end.
+
+## 8. Returning Iterators: `impl Iterator`
+
+Functions that *build* pipelines instead of consuming them need a return type, and the honest one is **`-> impl Iterator<Item = T>`**: "some concrete iterator type; you do not get to know which, and you do not need to". The function's body decides the single hidden type — generics at the return position, chapter 10's `-> impl Trait`, iterator edition.
+
+| Form | When |
+|---|---|
+| `-> impl Iterator<Item = T>` | one fixed chain in the body — the default |
+| `-> impl Iterator<Item = T> + '_` | the chain borrows an argument (ed. 2021 style; 2024 needs no clause) |
+| `-> Box<dyn Iterator<Item = T>>` | the body picks between *different* chain types |
+
+The edition note is a real difference this toolchain carries: under **edition 2024**, an RPIT captures *all* input lifetimes automatically, so the borrowing form compiles without `+ '_`; the same signature under **edition 2021** is refused with E0700 ("hidden type ... captures lifetime that does not appear in bounds") unless the clause is added. This project is edition 2024 — write the clean form.
+
+### The RPIT pipeline builder
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 8.1 -> impl Iterator: a pipeline factory, driven twice.
+fn band(candles: &[f64], lo: f64, hi: f64) -> impl Iterator<Item = f64> {
+    candles.iter().copied().filter(move |p| *p >= lo && *p <= hi)
+}
+let px = [4120.0, 4126.5, 4130.0, 4126.0];
+let in_band: Vec<f64> = band(&px, 4125.0, 4128.0).collect();
+assert_eq!(in_band, vec![4126.5, 4126.0]);
+// the same iterator, driven differently - it is reusable until consumed:
+let count = band(&px, 4125.0, 4128.0).count();
+let last = band(&px, 4125.0, 4128.0).last();
+assert_eq!(count, 2);
+assert_eq!(last, Some(4126.0));
+// borrowing form, edition-2024 style (no + '_ needed):
+fn doubles(data: &[i32]) -> impl Iterator<Item = i32> {
+    data.iter().copied().map(|x| x * 2)
+}
+let v = vec![1, 2, 3];
+assert_eq!(doubles(&v).max(), Some(6));
+assert_eq!(v.len(), 3); // the argument survived: the chain borrowed it
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+The bare form on `band` is edition-2024 behaviour: the returned iterator captures the *slice's* lifetime automatically, so the chain may borrow `candles` and the compiler tracks it — the `+ '_` clause you will see in older code is the edition-2021 spelling of the same intent, and this project's notebooks use the 2024 form (`doubles` below compiles identically). The `move` on `band`'s closure is chapter 05's move-closure: the bounds must live in the iterator, not on `band`'s stack.
+
+### The two-type wall
+
+The hidden type is *single*. A function whose body returns two different chain types is refused — and the refusal names the exact machinery:
+
+```text
+error[E0308]: `if` and `else` have incompatible types
+   |
+   |         (0..3).map(|x| x * 10)
+   |         ---------------------- expected because of this
+   |         (0..3).filter(|x| x % 2 == 0)
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `Map<Range<{integer}>, ...>`,
+   |                                      found `Filter<Range<{integer}>, ...>`
+   help: you could change the return type to be a boxed trait object
+   |
+   | fn picks(flag: bool) -> Box<dyn Iterator<Item = i32>> {
+```
+
+The two escapes: **make the types agree** (`filter(true, ..)`-style combinators like `Either`-shaping, or `.map()` both branches into one shape), or **erase the type** — `Box<dyn Iterator>`:
+
+### The boxed escape
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 8.2 Two chain types, one return: Box<dyn Iterator> erases the difference.
+fn picks(flag: bool) -> Box<dyn Iterator<Item = i32>> {
+    if flag {
+        Box::new((0..3).map(|x| x * 10))
+    } else {
+        Box::new((0..3).filter(|x| x % 2 == 0))
+    }
+}
+assert_eq!(picks(true).collect::<Vec<i32>>(), vec![0, 10, 20]);
+assert_eq!(picks(false).collect::<Vec<i32>>(), vec![0, 2]);
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+`Box<dyn Iterator>` is chapter 10's dynamic dispatch on iterators: one heap allocation for the box, an indirect call per `next`, no inlining across the erase — and no way for callers to name the type. The cost model (§11) prices it; the design rule is the dispatch rule: RPIT until the body genuinely branches between chain *types*, box when it does.
+
+## 9. Rolling Your Own Adaptor
+
+§2 built an iterator; building an *adaptor* — a wrapper that transforms another iterator — is the same move with a generic: hold an inner `I: Iterator`, implement `Iterator` by driving `I.next()`. The chapter's worked example: `Pairs`, a combiner that groups consecutive elements into `Option` pairs (odd tails get `None`), the shape `zip(it, it.skip(1))` reaches for:
+
+### The wrapper, generically
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 9.1 A custom adaptor: Pairs<I> wraps any iterator, groups into (a, b) pairs.
+struct Pairs<I: Iterator> {
+    inner: I,
+    held: Option<I::Item>, // one item of lookahead, if the count is odd
+}
+impl<I: Iterator> Pairs<I> {
+    fn new(mut inner: I) -> Self {
+        let held = inner.next();
+        Pairs { inner, held }
+    }
+}
+impl<I: Iterator> Iterator for Pairs<I> {
+    type Item = (I::Item, Option<I::Item>);
+    fn next(&mut self) -> Option<Self::Item> {
+        let first = self.held.take().or_else(|| self.inner.next())?;
+        let second = self.inner.next();
+        self.held = None;
+        Some((first, second))
+    }
+}
+impl<I: Iterator> FusedIterator for Pairs<I> {}
+// even count: clean pairs; odd count: the tail pairs with None
+let even: Vec<(i32, Option<i32>)> = Pairs::new(1..=4).collect();
+assert_eq!(even, vec![(1, Some(2)), (3, Some(4))]);
+let odd: Vec<(i32, Option<i32>)> = Pairs::new(1..=5).collect();
+assert_eq!(odd, vec![(1, Some(2)), (3, Some(4)), (5, None)]);
+// it composes with std adaptors in both positions:
+let sums: Vec<i32> = Pairs::new(1..=4).map(|(a, b)| a + b.unwrap_or(0)).collect();
+assert_eq!(sums, vec![3, 7]);
+let of_maps: Vec<i32> = Pairs::new((1..=4).map(|x| x * 10)).map(|(a, b)| a + b.unwrap()).collect();
+assert_eq!(of_maps, vec![30, 70]);
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+Read the impl against §2: `Pairs` is `Ticks` with an inner iterator and one `Option` of lookahead. Three techniques worth naming. **`self.held.take()`** — chapter 05's `Option::take` — is the one-slot buffer: consume the lookahead, leave `None` behind. **`?` inside `next`** — the early-return works in any function returning `Option`, including this one. **`Option<I::Item>` as the item type** — `Pairs` needs no bounds on `I::Item` beyond what `Iterator` already provides, so it works for references, `Copy` values, and `String`s alike. And it composes: `Pairs::new(inner.map(f))` and `Pairs::new(..).map(g)` are both fine, because *both* sides are just `Iterator`s to each other.
+
+That is the applied-track thesis in one code cell: std gave us `Map`, `Filter`, `Take` as structs-with-impls, and nothing stops yours from joining them on the shelf.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 10. Reading the Compiler: E-Codes
+
+This chapter's diagnostics are the iterator machinery talking: a desugar naming a method, an inference hole for `collect`'s target, a borrow rule meeting a closure. Every wording below was captured from this exact toolchain.
+
+| Diagnostic | Trigger | Message (abridged) | Fix |
+|---|---|---|---|
+| **E0599** | `.rev()` without `DoubleEndedIterator` | ``the trait bound `Ticks: DoubleEndedIterator` is not satisfied`` + ``required by a bound in `rev` `` | implement `next_back`, or use `into_iter().rev()` on collections |
+| **E0382** | using a collection after `into_iter()` consumed it | ``borrow of moved value: `v` `` | `iter()` when the source survives (§6.1) |
+| **E0507** | `map(\|o\| o.note)` over `iter()` on a non-`Copy` field | ``cannot move out of `o.note` which is behind a shared reference`` | `.clone()`, or `into_iter()` |
+| **E0283** | `collect()` with no target type | ``type annotations needed`` + ``the type must implement `FromIterator<i32>` `` | annotate: `let v: Vec<_> = ..collect();` |
+| **E0308** | `-> impl Iterator` with two chain types in the body | `` `if` and `else` have incompatible types `` — `Map<..>` vs `Filter<..>` | one hidden type, or `Box<dyn Iterator>` (§8.2) |
+| **E0689** | `1..4i32.map(f)` | ``can't call method `map` on type `i32` `` — the range bound grabbed the call | parenthesise: `(1..4i32).map(f)` |
+| **E0277** | `?` inside `next` propagating a foreign error | the chapter-11 bridge diagnostic, iterator edition | map the error at the `?`, or wrap |
+| **E0658** | `it.advance_by(n)` on stable 1.98 | ``see issue #77404`` — feature `iter_advance_by` is nightly | `nth(n)` / `skip(n)` are the stable tools |
+
+Three worth dwelling on. **E0689 is precedence wearing a diagnostic**: `1..4i32.map(f)` parses as `1..(4i32.map(f))` because the integer literal swallowed the method call — the compiler's hint ("you must surround the range in parentheses") is the fix and the lesson in one line. **E0283 is `collect`'s inference hole**: the *chain's* type is known but the *target* never appears in the expression — the annotation (or turbofish) supplies it, and the error's `FromIterator` note is the trait to remember. And **the `advance_by` row is a scope note, not a lesson**: the skipping method exists on nightly with an `Err(NonZeroUsize)` shortfall payload, but stable 1.98 answers `nth`/`skip` — the notebooks teach the stable surface, and this row is why the next crate chapter's pinning matters.
+
+### The catalogue, exercised
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 10.1 The three live diagnostics, dodged in one cell each.
+// E0689 dodged: parenthesise the range before calling methods on it
+let ok: Vec<i32> = (1..4i32).map(|x| x * 10).collect();
+assert_eq!(ok, vec![10, 20, 30]);
+// let bad: Vec<i32> = 1..4i32.map(|x| x * 10).collect();
+// error[E0689]: can't call method `map` on type `i32`
+// E0283 dodged: collect's target annotated (the turbofish is the same move)
+let ann: Vec<i32> = (0..3).map(|x| x * 2).collect();
+let fish = (0..3).map(|x| x * 2).collect::<Vec<i32>>();
+assert_eq!(ann, fish);
+// let n = (0..3).map(|x| x * 2).collect();
+// error[E0283]: type annotations needed
+//   = note: the type must implement `FromIterator<i32>`
+// E0599 dodged: rev on a source that implements DoubleEndedIterator
+let bwd: Vec<i32> = vec![1, 2, 3].into_iter().rev().collect();
+assert_eq!(bwd, vec![3, 2, 1]);
+// let bwd2: Vec<i32> = Ticks::new(0, 6, 2).rev().collect();
+// error[E0599]: the method `rev` exists for struct `Ticks`, but its trait bounds were not satisfied
+//   = note: the trait `DoubleEndedIterator` must be implemented
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 11. The Cost Model
+
+The iterator chain's price is the price of its *parts*, and the parts are structs — so the first cost column is bytes, probed with `size_of` on this toolchain:
+
+| Chain | Size (bytes) | Why |
+|---|---|---|
+| `Range<i32>` | 8 | two `i32`s: the cursor pair |
+| `slice::Iter<u32>` | 16 | pointer + end pointer |
+| `Map<slice::Iter, captureless closure>` | 16 | the closure is a **ZST** — zero bytes |
+| `Filter<slice::Iter, captureless closure>` | 16 | same: predicate costs nothing |
+| `Take<Range<u32>>` | 16 | + one `usize` counter |
+| `Zip<slice::Iter, Range<u32>>` | 40 | 16 + 8, **padded** to align both cursors |
+
+The ZST fact is the design win: a captureless closure holds no state, so `map`/`filter` wrappers cost *only the inner iterator* — a five-hop chain over a slice is still 16 bytes. Capture something (a bound, a `Vec`) and the wrapper grows by exactly that capture; `Zip` shows the honest overhead — two cursors padded for alignment.
+
+### Measured, in the kernel
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 11.1 The size table, re-measured (size_of is prelude, per chapter 08).
+use std::slice;
+let data: Vec<u32> = (0..16).collect();
+let m = data.iter().map(|x| x * 2);
+let f = data.iter().filter(|x| *x % 2 == 0);
+let t = (0..16u32).take(5);
+let z = data.iter().zip(0..16u32);
+fn size_of_of<T>(_: &T) -> usize {
+    size_of::<T>()
+}
+println!("Range<i32>          = {}", size_of::<std::ops::Range<i32>>());
+println!("slice::Iter<u32>    = {}", size_of::<slice::Iter<'_, u32>>());
+println!("Map<..>             = {}", size_of_of(&m));
+println!("Filter<..>          = {}", size_of_of(&f));
+println!("Take<Range<u32>>    = {}", size_of_of(&t));
+println!("Zip<Iter, Range>    = {}", size_of_of(&z));
+assert_eq!(size_of::<std::ops::Range<i32>>(), 8);
+assert_eq!(size_of_of(&m), 16); // 16 = the slice::Iter inside; closure is a ZST
+assert_eq!(size_of_of(&f), 16);
+assert_eq!(size_of_of(&t), 16); // + the counter, 8 = 8 + 8
+assert_eq!(size_of_of(&z), 40); // 16 + 8, padded
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+### The timing rows: one allocation, one loop
+
+Two probed numbers close the cost story, both structural:
+
+- **`collect` with an exact hint allocates once.** `(0..N).collect::<Vec<u64>>()` and `Vec::with_capacity(N) + extend` measure the same on this machine (both ≈44 ms for 10 M items; the ratio wanders, the equality of shape does not) — because `Range` is `ExactSizeIterator`, `collect` calls `with_capacity(N)` for you. An unknown-length source (say, `filter`'s output) grows instead: amortised doubling, several reallocations, same final contents.
+- **A chain is a loop.** `big.iter().map(|x| x*3).sum()` versus the hand-written `for` with `wrapping_add`: on a 4 M-element vector this probe saw ≈10 ms versus ≈8 ms — the chain carried a ~25% tax in *this* run, and that tax is the honest caveat: inlining usually closes the gap to zero, but a multi-hop chain with closure-heavy bodies can leave a little on the table in a debug build. Measure hot loops; default to chains for clarity.
+
+### The boxed row
+
+`Box<dyn Iterator>` (§8.2) adds the chapter-10 fat-pointer costs: one heap allocation at construction, an indirect call per `next`, no inlining across the vtable. The RPIT form keeps the chain static — which is why `-> impl Iterator` is the default and the box the escape.
+
+## 12. Mental Model: The Pump
+
+| Question | Answer with | Where |
+|---|---|---|
+| "How do I consume it step by step?" | `next()` — the only required method | §1 |
+| "How do I transform without running?" | an adaptor — a struct wrap, lazy by construction | §3 |
+| "How do I run it?" | a consumer: `collect`, `sum`, `find`, `any`, `fold` | §3, §7 |
+| "How do I stop early?" | short-circuit consumers, or `take` | §4 |
+| "Where does the result go?" | any `FromIterator` — including `Result`/`Option` | §5 |
+| "Who owns the source afterwards?" | `iter` / `iter_mut` / `into_iter` — and the `&` on `for` | §6 |
+| "How do I return a pipeline?" | `-> impl Iterator<Item = T>`; box only on real branches | §8 |
+| "How do I add to the shelf?" | struct + `impl Iterator` — §2 is the whole recipe | §2, §9 |
+
+Read the table as the pump's control panel: **pull** (`next`), **shape** (adaptors), **drive** (consumers), **land** (`collect`'s target), **return** (RPIT). Python's generator pipeline has the pull and the laziness but types vanish into `Iterator[Any]`; C++20 ranges have the shapes and the types but the error messages; Rust has both because the pump is one trait and the wrappers are plain structs — the chapter-10 thesis, running your data.
+
+## 13. Cheat Sheet
+
+| Task | Code |
+|---|---|
+| the protocol | `fn next(&mut self) -> Option<Item>` |
+| the marker | `impl FusedIterator for T {}` (once `None`, always `None`) |
+| exact length | override `size_hint` → `(n, Some(n))`, then `impl ExactSizeIterator` |
+| the workhorse | `iter().map(f).filter(p).collect::<Vec<_>>()` |
+| drop failures | `.filter_map(\|r\| r.parse().ok())` |
+| fail-fast collect | `let v: Result<Vec<u32>, _> = rows.iter().map(parse).collect();` |
+| pagination | `(0..n).skip(off).take(len)` |
+| pair up | `zip(other)` — ends when either ends |
+| group slices | `chunks(n)` (ragged tail) / `windows(n)` (`k - n + 1` panes) |
+| accumulate | `fold(init, f)`; stateful steps live here, not in `map` |
+| fallible accumulate | `try_fold(init, \|acc, x\| acc.checked_add(x).ok_or("overflow"))` |
+| in place | `for x in &mut v` / `v.iter_mut().zip(rates)` |
+| own the items | `v.into_iter()` — `v` is gone after (E0382) |
+| return a pipeline | `fn f(..) -> impl Iterator<Item = T> { chain }` |
+| branch between chains | `Box<dyn Iterator<Item = T>>` (§8.2) |
+| parenthesise ranges | `(1..4i32).map(f)` — E0689 without |
+| the target annotation | `let v: Vec<_> = ..collect();` or `.collect::<Vec<_>>()` — E0283 without |
+
+## 14. Review
+
+Answer from memory; each one is a §-numbered cell away.
+
+1. `Ticks` implements only `Iterator`. Which three things did the one impl provide, and which marker promise did the empty `FusedIterator` impl add? (§2.1)
+2. `size_hint` returns `(3, Some(3))`. What does the equality buy `collect`, which trait upgrade does it enable, and what happens when an iterator lies? (§2.2, §11)
+3. A bare `v.iter().map(f);` compiles. What is the value, why does the compiler warn, and which consumer would silence it *usefully*? (§3.1)
+4. The §4.1 counter read 0, then 5. Name the two states and the third (dropped unconsumed) — and why is "put cheap filters first" a consequence of laziness rather than a style tip? (§4.1)
+5. `chunks(3)` and `windows(3)` on a 7-element slice: how many items each, what happens to the tail, and which one panics when the pane exceeds the slice? (§4.3)
+6. `collect::<Result<Vec<u32>, _>>()` short-circuits. Which trait makes that possible, what does the `_` resolve to here, and which chapter-11 mechanism is this the consumer edition of? (§5.2)
+7. `for x in &v` versus `for x in v`: what does each yield, what does each leave of `v`, and which E-code fires when the second form's source is used afterwards? (§6.1)
+8. `fold` can express "track the minimum so far"; `map` cannot. What is the structural difference, and which §7.1 cell shows the state-carrying form? (§7.1)
+9. `try_fold` with `checked_add` returned `Err("overflow")` on `[u64::MAX, 1]`. What stopped pulling, what does the consumer return, and where have you met this pull-and-stop shape before in this chapter? (§7.2, §4.2, §5.2)
+10. `band(&px, lo, hi)` compiles with no `+ '_` clause on this toolchain. Why, what would edition 2021 have demanded, and which E-code is the 2021 refusal? (§8.1)
+11. The two-branch `picks` needed `Box<dyn Iterator>`. Which diagnostic named the two types, what does the box cost per `next`, and what is the default return form when the body has one chain? (§8.2, §11)
+12. `Pairs` needed one `Option` field. What does `take()` do for the lookahead, and why does `Pairs` work unchanged over `map`-wrapped inner iterators? (§9.1)
+
+### What Comes Next
+
+The iterator chapter closes std's core-machinery run; what follows is composition at larger scales:
+
+| Chapter | Title | What it settles |
+|---|---|---|
+| **13** | **Modules, Crates and Testing** | where `pub` finally bites — and `#[test]` functions that are mostly iterator chains |
+| 14 | Smart Pointers and Interior Mutability | `Rc`/`RefCell` — the sharing that §4.1's counter borrowed, properly introduced |
+| 15 | Data Types and Their Libraries | `polars` — iterators over columns, at library scale |
+
+**Carry forward.** You should now be able to do these without looking anything up:
+
+- implement an iterator from scratch (`next`, `Item`, `FusedIterator`, exact `size_hint`)
+- predict what runs and when: adaptors never, consumers always, short-circuits on demand
+- choose the `collect` target — `Vec`, `String`, `HashMap`, `Result` — and spell it when inference cannot
+- pick the right form of the three (`iter`/`iter_mut`/`into_iter`) and say who survives
+- accumulate with `fold`, and go fallible with `try_fold` + `?`
+- return pipelines with `-> impl Iterator`, and know exactly when the box is needed
+- extend the shelf with your own adaptor over any `Iterator`
+</VSCode.Cell>

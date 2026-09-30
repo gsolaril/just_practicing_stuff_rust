@@ -1,0 +1,1213 @@
+<VSCode.Cell language="markdown">
+# Rust 122: Capstone — Practice
+
+Companion exercises for `22_capstone-market-data_e.ipynb`. The service you assemble here is the example notebook's, stage by stage: the three desk servers are given verbatim, every pipeline stage is an exercise, and the checks assert on the desks' observable state — request logs, transaction ledgers, protocol replies.
+
+The checks at the bottom of each cell are the grader. Edit only the `todo!()` bodies; when a cell runs without panicking you will see an `Exercise N.M passed` line.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+### Contents
+
+- [0. How to Complete These Exercises](#0-how-to-complete-these-exercises)
+- [1. The Desk: Three Servers, One Namespace](#1-the-desk-three-servers-one-namespace)
+- [2. The Spine: Fill, Quote, ServiceError](#2-the-spine-fill-quote-serviceerror)
+- [3. Stage 1 + 2: Ingest, Cache-Aside](#3-stage-1--2-ingest-cache-aside)
+- [4. Stage 3: Persist in a Transaction](#4-stage-3-persist-in-a-transaction)
+- [5. Stage 4: The Pure Kernel](#5-stage-4-the-pure-kernel)
+- [6. The Façade: run_service](#6-the-facade-run_service)
+- [7. The Surface: A CLI Report](#7-the-surface-a-cli-report)
+- [8. Graceful Shutdown](#8-graceful-shutdown)
+- [9. Mixed Review](#9-mixed-review)
+- [10. What Comes Next](#10-what-comes-next)
+
+§1–§8 each have exercises for the demonstration cells of the example notebook; §9 mixes corners.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 0. How to Complete These Exercises
+
+This notebook runs on the same **evcxr** kernel as the example notebook. Three consequences shape how you work:
+
+1. **No `fn main`.** The body of a cell *is* the body of `main`. Type statements directly.
+2. **State persists.** A binding from an earlier cell is visible in every cell below it — including `use` lines.
+3. **Items are order-independent.** A struct or fn may be used above the cell that defines it.
+
+> **Item names must be unique across the whole notebook.** Every cell shares one namespace; two functions with the same name are a redefinition error even in different sections. The same rule covers `use` lines: the first cell that needs a name is the one that imports; later cells rely on persistence — a repeated `use` is E0252. And a trailing `//` comment after a `use` line's semicolon hides that semicolon from the tooling — put the comment on its own line above.
+
+### The stub convention
+
+Each exercise cell declares signatures with contract doc comments and a `// --- check (do not modify) ---` block of asserts. The body you must fill in is `todo!()`, which compiles but **panics** when executed. Replace it and re-run; an `Exercise N.M passed` line means you are done.
+
+### Four notes specific to this chapter
+
+- **Every check builds its own desks.** The given helpers (§1.1) start fresh HTTP, RESP2, and PostgreSQL-v3 servers on ephemeral ports; nothing here touches a real network.
+- **Async stubs are driven by the check's runtime.** A stub that needs the cache or the store is an `async fn` (taking the URL/port or the connection/pool); the check builds a `Runtime` and `block_on`s it. The **blocking HTTP client never runs inside a runtime** — chapter 16's drop-panic is the desk's own receipt; the origin call happens outside `block_on`.
+- **Errors surface as the one enum.** Stage stubs return `Result<_, MdServiceError>`; the `From` impls (§2.1, given) do the converting — `?` is all a body needs.
+- **The crate cell below is given and must run first.** Six crates, one wave (chapter 19's); a `cannot find crate` diagnostic means it has not run.
+
+### Expect warnings until you finish
+
+Three warning families are normal and self-cleaning: `unused variable` on unsolved stubs, `unused import` on the `use` lines serving them, and stub-induced dead code on given helpers only a *solution* calls. No stub takes a `mut` binding parameter.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 0.1 The chapter's crate cell: six crates, one wave, run once.
+:dep tokio = { version = "1", features = ["full"] }
+:dep reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "charset"] }
+:dep redis = { version = "0.27", default-features = false, features = ["tokio-comp", "serde"] }
+:dep serde = { version = "1", features = ["derive"] }
+:dep serde_json = "1"
+:dep sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres"] }
+
+let rt = tokio::runtime::Runtime::new().unwrap();
+let answer = rt.block_on(async { 40 + 2 });
+assert_eq!(answer, 42);
+println!("crates loaded; block_on smoke: {}", answer);
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 1. The Desk: Three Servers, One Namespace
+
+The given helpers below are chapters 17, 18, and 19 verbatim, prefixed (`md_`/`rd_`/`pg_`) to share one namespace — §21.5's module tree, flattened. The store's transaction ledger appends to `pg_tx_p.log` (the example notebook's writes `pg_tx_c.log`), so both notebooks' receipts survive side by side.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 1.1 Given: the three desk servers — and the first exercises on top of them.
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::sync::{Arc, Mutex};
+
+// ---- the feed: chapter 17's HTTP desk ----
+
+/// Start a fresh local HTTP server; return (base_url, request_log). Given.
+fn md_url_desk() -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let log2 = Arc::clone(&log);
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let l = Arc::clone(&log2);
+            std::thread::spawn(move || md_serve_one(stream, l));
+        }
+    });
+    (format!("http://127.0.0.1:{}", port), log)
+}
+
+fn md_serve_one(stream: std::net::TcpStream, log: Arc<Mutex<Vec<String>>>) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let mut reader = BufReader::new(match stream.try_clone() { Ok(s) => s, Err(_) => return });
+    let mut line = String::new();
+    if reader.read_line(&mut line).is_err() { return; }
+    let mut parts = line.split_whitespace();
+    let method = parts.next().unwrap_or("").to_string();
+    let path = parts.next().unwrap_or("").to_string();
+    let mut content_len = 0usize;
+    loop {
+        let mut h = String::new();
+        if reader.read_line(&mut h).is_err() { return; }
+        if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") {
+            content_len = v.trim().parse().unwrap_or(0);
+        }
+        if h.trim().is_empty() { break; }
+    }
+    let mut body = vec![0u8; content_len];
+    if content_len > 0 { reader.read_exact(&mut body).ok(); }
+    log.lock().unwrap().push(format!("{} {}", method, path));
+    let route = path.split('?').next().unwrap_or("").to_string();
+    let (status, ctype, payload): (u16, &'static str, Vec<u8>) = match (method.as_str(), route.as_str()) {
+        ("GET", "/ok") => (200, "text/plain", b"spire local ok".to_vec()),
+        ("GET", "/json") => (200, "application/json", br#"{"sym":"SPIRE","px":101.5}"#.to_vec()),
+        ("GET", "/fills") => (200, "application/json",
+            br#"[{"sym":"AAA","px":10.0,"qty":100},{"sym":"BBB","px":20.5,"qty":200}]"#.to_vec()),
+        ("GET", "/error") => (500, "text/plain", b"boom".to_vec()),
+        _ => (404, "text/plain", b"nope".to_vec()),
+    };
+    let mut head = format!("HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n", status, ctype, payload.len());
+    head.push_str("\r\n");
+    let mut s = stream;
+    s.write_all(head.as_bytes()).ok();
+    s.write_all(&payload).ok();
+}
+
+// ---- the cache: chapter 18's RESP2 desk ----
+
+fn rd_bulk(s: &str) -> String { format!("${}\r\n{}\r\n", s.len(), s) }
+
+fn rd_crlf(mut s: String) -> String {
+    if !s.ends_with("\r\n") { s.push_str("\r\n"); }
+    s
+}
+
+fn rd_find(hay: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
+    if needle.len() > hay.len() || from > hay.len() - needle.len() { return None; }
+    (from..=hay.len() - needle.len()).find(|&i| &hay[i..i + needle.len()] == needle)
+}
+
+fn rd_now_ms() -> u128 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
+}
+
+#[derive(Default)]
+struct RdDb {
+    kv: HashMap<String, String>,
+    expiry_ms: HashMap<String, u128>,
+    lists: HashMap<String, Vec<String>>,
+    sets: HashMap<String, Vec<String>>,
+    hashes: HashMap<String, Vec<(String, String)>>,
+}
+
+fn rd_alive(d: &RdDb, key: &str) -> bool {
+    let exists = d.kv.contains_key(key) || d.lists.contains_key(key)
+        || d.sets.contains_key(key) || d.hashes.contains_key(key);
+    exists && d.expiry_ms.get(key).map_or(true, |&t| t > rd_now_ms())
+}
+
+fn rd_sweep(d: &mut RdDb) {
+    let dead: Vec<String> = d.expiry_ms.iter()
+        .filter(|e| *e.1 <= rd_now_ms()).map(|e| e.0.clone()).collect();
+    for k in dead {
+        d.kv.remove(&k); d.expiry_ms.remove(&k);
+        d.lists.remove(&k); d.sets.remove(&k); d.hashes.remove(&k);
+    }
+}
+
+fn rd_arg(cmd: &[Vec<u8>], i: usize) -> String {
+    cmd.get(i).map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default()
+}
+
+fn rd_dispatch(d: &mut RdDb, cmd: &[Vec<u8>]) -> String {
+    rd_sweep(d);
+    let name = String::from_utf8_lossy(&cmd[0]).to_uppercase();
+    match name.as_str() {
+        "PING" => "+PONG".to_string(),
+        "ECHO" => rd_bulk(&rd_arg(cmd, 1)),
+        "SET" | "SETEX" => {
+            let k = rd_arg(cmd, 1);
+            if name == "SETEX" {
+                let secs: u128 = rd_arg(cmd, 2).parse().unwrap_or(0);
+                d.expiry_ms.insert(k.clone(), rd_now_ms() + secs * 1000);
+                d.kv.insert(k, rd_arg(cmd, 3));
+                return "+OK".to_string();
+            }
+            let mut ttl = None;
+            let mut i = 3;
+            while i < cmd.len() {
+                let o = rd_arg(cmd, i).to_uppercase();
+                if o == "EX" { ttl = Some(rd_now_ms() + rd_arg(cmd, i + 1).parse::<u128>().unwrap_or(0) * 1000); i += 2; }
+                else if o == "PX" { ttl = Some(rd_now_ms() + rd_arg(cmd, i + 1).parse::<u128>().unwrap_or(0)); i += 2; }
+                else { i += 1; }
+            }
+            if let Some(t) = ttl { d.expiry_ms.insert(k.clone(), t); }
+            d.kv.insert(k, rd_arg(cmd, 2));
+            "+OK".to_string()
+        }
+        "GET" => {
+            let k = rd_arg(cmd, 1);
+            if rd_alive(d, &k) { rd_bulk(&d.kv[&k]) } else { "$-1\r\n".to_string() }
+        }
+        "DEL" => {
+            let mut n = 0;
+            for i in 1..cmd.len() {
+                let k = rd_arg(cmd, i);
+                let mut gone = d.kv.remove(&k).is_some();
+                gone |= d.lists.remove(&k).is_some();
+                gone |= d.sets.remove(&k).is_some();
+                gone |= d.hashes.remove(&k).is_some();
+                d.expiry_ms.remove(&k);
+                if gone { n += 1; }
+            }
+            format!(":{}", n)
+        }
+        "EXISTS" => format!(":{}", if rd_alive(d, &rd_arg(cmd, 1)) { 1 } else { 0 }),
+        "TTL" | "PTTL" => {
+            let k = rd_arg(cmd, 1);
+            if !rd_alive(d, &k) {
+                let lingering = d.kv.contains_key(&k) || d.lists.contains_key(&k)
+                    || d.sets.contains_key(&k) || d.hashes.contains_key(&k);
+                if lingering { ":-1".to_string() } else { ":-2".to_string() }
+            } else if let Some(&t) = d.expiry_ms.get(&k) {
+                let ms = t.saturating_sub(rd_now_ms());
+                if name == "PTTL" { format!(":{}", ms) } else { format!(":{}", (ms + 999) / 1000) }
+            } else { ":-1".to_string() }
+        }
+        "EXPIRE" | "PEXPIRE" => {
+            let k = rd_arg(cmd, 1);
+            let mult: u128 = if name == "EXPIRE" { 1000 } else { 1 };
+            let amount: u128 = rd_arg(cmd, 2).parse().unwrap_or(0);
+            if rd_alive(d, &k) { d.expiry_ms.insert(k, rd_now_ms() + amount * mult); ":1".to_string() } else { ":0".to_string() }
+        }
+        "PERSIST" => {
+            let k = rd_arg(cmd, 1);
+            if rd_alive(d, &k) && d.expiry_ms.remove(&k).is_some() { ":1".to_string() } else { ":0".to_string() }
+        }
+        "INCR" | "INCRBY" => {
+            let k = rd_arg(cmd, 1);
+            let delta: i64 = if name == "INCR" { 1 } else { rd_arg(cmd, 2).parse().unwrap_or(0) };
+            let v: i64 = d.kv.get(&k).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let nv = v + delta;
+            d.kv.insert(k, nv.to_string());
+            format!(":{}", nv)
+        }
+        "HSET" => {
+            let k = rd_arg(cmd, 1);
+            let mut added = 0i64;
+            let e = d.hashes.entry(k).or_default();
+            let mut a = 2;
+            while a + 1 < cmd.len() {
+                let f = rd_arg(cmd, a);
+                let v = rd_arg(cmd, a + 1);
+                if let Some(p) = e.iter_mut().find(|(pf, _)| *pf == f) { p.1 = v; }
+                else { e.push((f, v)); added += 1; }
+                a += 2;
+            }
+            format!(":{}", added)
+        }
+        "HGET" => {
+            let k = rd_arg(cmd, 1);
+            let f = rd_arg(cmd, 2);
+            match d.hashes.get(&k).and_then(|h| h.iter().find(|(pf, _)| pf == &f)) {
+                Some((_, v)) => rd_bulk(v),
+                None => "$-1\r\n".to_string(),
+            }
+        }
+        "CLIENT" | "SELECT" | "AUTH" => "+OK".to_string(),
+        "HELLO" => "-ERR unknown command 'HELLO'".to_string(),
+        "CONFIG" | "COMMAND" => "*0\r\n".to_string(),
+        _ => format!("-ERR unknown command '{}'", name),
+    }
+}
+
+enum RdParsed { None, Skip(#[allow(dead_code)] usize), Cmd(Vec<Vec<u8>>, usize) }
+
+fn rd_parse_one(buf: &[u8]) -> RdParsed {
+    if buf.is_empty() { return RdParsed::None; }
+    if buf[0] == b'*' {
+        let hdr = match rd_find(buf, 0, b"\r\n") { Some(i) => i, None => return RdParsed::None };
+        let n: usize = match std::str::from_utf8(&buf[1..hdr]).ok().and_then(|s| s.parse().ok()) {
+            Some(n) => n, None => return RdParsed::Skip(hdr + 2),
+        };
+        let mut p = hdr + 2;
+        let mut args = Vec::new();
+        for _ in 0..n {
+            if p >= buf.len() { return RdParsed::None; }
+            if buf[p] != b'$' { return RdParsed::Skip(p); }
+            let len_end = match rd_find(buf, p, b"\r\n") { Some(i) => i, None => return RdParsed::None };
+            let len: usize = match std::str::from_utf8(&buf[p + 1..len_end]).ok().and_then(|s| s.parse().ok()) {
+                Some(l) => l, None => return RdParsed::Skip(len_end + 2),
+            };
+            p = len_end + 2;
+            if p + len + 2 > buf.len() { return RdParsed::None; }
+            args.push(buf[p..p + len].to_vec());
+            p += len + 2;
+        }
+        RdParsed::Cmd(args, p)
+    } else {
+        let line_end = match rd_find(buf, 0, b"\n") { Some(i) => i, None => return RdParsed::None };
+        let line = String::from_utf8_lossy(&buf[..line_end]).trim().to_string();
+        if line.is_empty() { return RdParsed::Skip(line_end + 1); }
+        RdParsed::Cmd(line.split_whitespace().map(|s| s.as_bytes().to_vec()).collect(), line_end + 1)
+    }
+}
+
+/// Start a fresh RESP2 desk; return its URL. Given.
+fn md_redis_desk() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let db: Arc<Mutex<RdDb>> = Arc::new(Mutex::new(RdDb::default()));
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let db = Arc::clone(&db);
+            std::thread::spawn(move || {
+                let mut r = match stream.try_clone() { Ok(s) => s, Err(_) => return };
+                let mut w = stream;
+                r.set_read_timeout(Some(std::time::Duration::from_millis(10))).ok();
+                let mut buf: Vec<u8> = Vec::new();
+                let mut tmp = [0u8; 8192];
+                loop {
+                    match r.read(&mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut => continue,
+                        Err(_) => break,
+                    }
+                    while let RdParsed::Cmd(cmd, used) = rd_parse_one(&buf) {
+                        buf.drain(..used);
+                        if cmd.is_empty() { continue; }
+                        let reply = rd_dispatch(&mut db.lock().unwrap(), &cmd);
+                        w.write_all(rd_crlf(reply).as_bytes()).ok();
+                        w.flush().ok();
+                    }
+                }
+            });
+        }
+    });
+    format!("redis://127.0.0.1:{}", port)
+}
+
+// ---- the store: chapter 19's PostgreSQL v3 desk ----
+
+fn pg_msg(tag: u8, body: &[u8]) -> Vec<u8> {
+    let mut out = vec![tag];
+    out.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+    out.extend_from_slice(body);
+    out
+}
+fn pg_cstr(s: &str) -> Vec<u8> { let mut v = s.as_bytes().to_vec(); v.push(0); v }
+fn pg_i32be(n: i32) -> Vec<u8> { n.to_be_bytes().to_vec() }
+fn pg_i16be(n: i16) -> Vec<u8> { n.to_be_bytes().to_vec() }
+fn pg_authentication_ok() -> Vec<u8> { pg_msg(b'R', &pg_i32be(0)) }
+fn pg_parameter_status(k: &str, v: &str) -> Vec<u8> { let mut b = pg_cstr(k); b.extend(pg_cstr(v)); pg_msg(b'S', &b) }
+fn pg_ready_for_query(status: u8) -> Vec<u8> { pg_msg(b'Z', &[status, 0]) }
+fn pg_command_complete(tag: &str) -> Vec<u8> { pg_msg(b'C', &pg_cstr(tag)) }
+fn pg_error_response(code: &str, message: &str) -> Vec<u8> {
+    let mut b = vec![b'S']; b.extend(pg_cstr("ERROR")); b.push(b'V'); b.extend(pg_cstr("ERROR"));
+    b.push(b'C'); b.extend(pg_cstr(code)); b.push(b'M'); b.extend(pg_cstr(message)); b.push(0);
+    pg_msg(b'E', &b)
+}
+fn pg_parse_complete() -> Vec<u8> { pg_msg(b'1', &[]) }
+fn pg_bind_complete() -> Vec<u8> { pg_msg(b'2', &[]) }
+fn pg_no_data() -> Vec<u8> { pg_msg(b'n', &[]) }
+fn pg_empty_query_response() -> Vec<u8> { pg_msg(b'I', &[]) }
+
+const PG_INT4: i32 = 23;
+const PG_TEXT: i32 = 25;
+struct PgCol { name: &'static str, oid: i32, fmt: i16 }
+fn pg_int4col(name: &'static str) -> PgCol { PgCol { name, oid: PG_INT4, fmt: 1 } }
+fn pg_textcol(name: &'static str) -> PgCol { PgCol { name, oid: PG_TEXT, fmt: 0 } }
+fn pg_row_description(cols: &[PgCol]) -> Vec<u8> {
+    let mut b = pg_i16be(cols.len() as i16);
+    for c in cols {
+        b.extend(pg_cstr(c.name)); b.extend(pg_i32be(0)); b.extend(pg_i16be(0)); b.extend(pg_i32be(c.oid));
+        b.extend(pg_i16be(if c.oid == PG_INT4 { 4 } else { -1 })); b.extend(pg_i32be(-1)); b.extend(pg_i16be(c.fmt));
+    }
+    pg_msg(b'T', &b)
+}
+type PgCell = Option<Vec<u8>>;
+type PgWireRow = Vec<PgCell>;
+fn pg_data_row(row: &[PgCell]) -> Vec<u8> {
+    let mut b = pg_i16be(row.len() as i16);
+    for cell in row {
+        match cell {
+            Some(v) => { b.extend(pg_i32be(v.len() as i32)); b.extend(v); }
+            None => b.extend(pg_i32be(-1)),
+        }
+    }
+    pg_msg(b'D', &b)
+}
+
+#[derive(Default)]
+struct PgDb {
+    rows: Vec<(i32, Option<String>)>,
+    next_id: i32,
+    snapshot: Option<(Vec<(i32, Option<String>)>, i32)>,
+}
+impl PgDb {
+    fn tx_note(&self, kind: &str) {
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("pg_tx_p.log") {
+            writeln!(f, "{}", kind).ok();
+        }
+    }
+}
+type PgShared = Arc<Mutex<PgDb>>;
+
+fn pg_run_query(db: &mut PgDb, sql: &str, params: &[Option<String>], in_tx: bool) -> (Vec<u8>, bool) {
+    let q = sql.trim();
+    let ql = q.to_lowercase();
+    if q.is_empty() { return (pg_empty_query_response(), in_tx); }
+    let err = |code: &str, m: &str| (pg_error_response(code, m), in_tx);
+    let p0 = || params.first().and_then(|p| p.clone());
+    if ql == "begin" || ql.starts_with("begin ") {
+        if in_tx { return err("25001", "there is already a transaction in progress"); }
+        db.snapshot = Some((db.rows.clone(), db.next_id));
+        db.tx_note("BEGIN");
+        return (pg_command_complete("BEGIN"), true);
+    }
+    if ql == "commit" || ql == "commit work" || ql == "end" {
+        if !in_tx { return err("25P01", "there is no transaction in progress"); }
+        db.snapshot = None;
+        db.tx_note("COMMIT");
+        return (pg_command_complete("COMMIT"), false);
+    }
+    if ql.starts_with("rollback") {
+        if !in_tx { return err("25P01", "there is no transaction in progress"); }
+        if let Some((rows, next)) = db.snapshot.take() { db.rows = rows; db.next_id = next; }
+        db.tx_note("ROLLBACK");
+        return (pg_command_complete("ROLLBACK"), false);
+    }
+    if ql == "select 1" || ql == "select 1;" {
+        let cols = [pg_int4col("n")];
+        let mut out = pg_row_description(&cols);
+        out.extend(pg_data_row(&[Some(pg_i32be(1))]));
+        out.extend(pg_command_complete("SELECT 1"));
+        return (out, in_tx);
+    }
+    if ql.starts_with("select count(*)") {
+        let cols = [pg_int4col("count")];
+        let mut out = pg_row_description(&cols);
+        out.extend(pg_data_row(&[Some(pg_i32be(db.rows.len() as i32))]));
+        out.extend(pg_command_complete("SELECT 1"));
+        return (out, in_tx);
+    }
+    if ql.starts_with("select") {
+        if !ql.contains("from t") && !ql.contains("from fills") {
+            let table = ql.split_whitespace().skip_while(|w| *w != "from").nth(1).unwrap_or("?").trim_end_matches(';');
+            return err("42P01", &format!("relation \"{}\" does not exist", table));
+        }
+        let cols = [pg_int4col("id"), pg_textcol("name")];
+        let filter = if ql.contains("where name = $1") { p0() } else { None };
+        let mut rs: Vec<PgWireRow> = db.rows.iter()
+            .filter(|(_, name)| match &filter {
+                Some(f) => name.as_deref() == Some(f.as_str()),
+                None => true,
+            })
+            .map(|(id, name)| vec![Some(pg_i32be(*id)), name.as_ref().map(|n| n.as_bytes().to_vec())])
+            .collect();
+        rs.sort_by(|a, b| match (&a[0], &b[0]) {
+            (Some(x), Some(y)) => x.cmp(y),
+            _ => std::cmp::Ordering::Equal,
+        });
+        let tag = format!("SELECT {}", rs.len());
+        let mut out = pg_row_description(&cols);
+        for r in &rs { out.extend(pg_data_row(r)); }
+        out.extend(pg_command_complete(&tag));
+        return (out, in_tx);
+    }
+    if ql.starts_with("insert") {
+        let id = db.next_id;
+        db.next_id += 1;
+        db.rows.push((id, p0()));
+        return (pg_command_complete("INSERT 0 1"), in_tx);
+    }
+    if ql.starts_with("update") {
+        let nv = p0();
+        let mut n = 0;
+        for r in db.rows.iter_mut() { r.1 = nv.clone(); n += 1; }
+        return (pg_command_complete(&format!("UPDATE {}", n)), in_tx);
+    }
+    if ql.starts_with("delete") {
+        let n = db.rows.len();
+        db.rows.clear();
+        return (pg_command_complete(&format!("DELETE {}", n)), in_tx);
+    }
+    err("42601", &format!("syntax error at or near \"{}\"", &q[..q.len().min(24)]))
+}
+
+fn pg_returns_rows(sql: &str) -> bool { sql.trim().to_lowercase().starts_with("select") }
+fn pg_cstring_at(body: &[u8], from: usize) -> String {
+    let mut end = from;
+    while end < body.len() && body[end] != 0 { end += 1; }
+    String::from_utf8_lossy(&body[from..end]).into_owned()
+}
+struct PgConn {
+    statements: HashMap<String, String>,
+    portals: HashMap<String, (String, Vec<Option<String>>)>,
+    in_tx: bool,
+}
+fn pg_handle(mut stream: std::net::TcpStream, db: PgShared) {
+    let _ = stream.set_nodelay(true);
+    let mut buf: Vec<u8> = Vec::new();
+    let mut tmp = [0u8; 16384];
+    loop {
+        if buf.len() >= 8 {
+            let l = i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+            if buf.len() >= l { break; }
+        }
+        match stream.read(&mut tmp) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+        }
+    }
+    let code = i32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    if code == 80877103 {
+        let _ = stream.write_all(b"N");
+        buf.drain(..8);
+        loop {
+            if buf.len() >= 8 {
+                let l = i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+                if buf.len() >= l { break; }
+            }
+            match stream.read(&mut tmp) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            }
+        }
+    }
+    let len = i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    let protocol = i32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    buf.drain(..len);
+    if protocol != 196608 {
+        stream.write_all(&pg_error_response("28000", "unsupported protocol")).ok();
+        return;
+    }
+    let mut out = Vec::new();
+    out.extend(pg_authentication_ok());
+    for (k, v) in [("server_version", "16.9"), ("client_encoding", "UTF8"), ("DateStyle", "ISO, MDY"), ("integer_datetimes", "on"), ("TimeZone", "UTC"), ("standard_conforming_strings", "on")] {
+        out.extend(pg_parameter_status(k, v));
+    }
+    out.extend(pg_ready_for_query(b'I'));
+    if stream.write_all(&out).is_err() { return; }
+    stream.flush().ok();
+    let mut conn = PgConn { statements: HashMap::new(), portals: HashMap::new(), in_tx: false };
+    loop {
+        while buf.len() < 5 {
+            match stream.read(&mut tmp) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            }
+        }
+        let want = 1 + i32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+        while buf.len() < want {
+            match stream.read(&mut tmp) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            }
+        }
+        let tag = buf[0];
+        let mlen = i32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+        let total = 1 + mlen;
+        if mlen < 4 { continue; }
+        let body = if mlen > 4 { buf[5..total].to_vec() } else { Vec::new() };
+        buf.drain(..total);
+        let mut reply: Vec<u8> = Vec::new();
+        match tag {
+            b'Q' => {
+                let query = pg_cstring_at(&body, 0);
+                let mut d = db.lock().unwrap();
+                let (payload, tx) = pg_run_query(&mut d, &query, &[], conn.in_tx);
+                conn.in_tx = tx;
+                reply.extend(payload);
+                reply.extend(pg_ready_for_query(if tx { b'T' } else { b'I' }));
+            }
+            b'P' => {
+                let name = pg_cstring_at(&body, 0);
+                let sql = pg_cstring_at(&body, name.len() + 1);
+                conn.statements.insert(name, sql);
+                reply.extend(pg_parse_complete());
+            }
+            b'B' => {
+                let portal = pg_cstring_at(&body, 0);
+                let sstart = portal.len() + 1;
+                let stmt = pg_cstring_at(&body, sstart);
+                let sql = conn.statements.get(&stmt).cloned().unwrap_or_default();
+                let mut p = sstart + stmt.len() + 1;
+                let mut params: Vec<Option<String>> = Vec::new();
+                if p + 2 <= body.len() {
+                    let nfmt = i16::from_be_bytes([body[p], body[p + 1]]) as usize;
+                    p += 2 + nfmt * 2;
+                    if p + 2 <= body.len() {
+                        let nvals = i16::from_be_bytes([body[p], body[p + 1]]) as usize;
+                        p += 2;
+                        for _ in 0..nvals {
+                            if p + 4 > body.len() { break; }
+                            let vlen = i32::from_be_bytes([body[p], body[p + 1], body[p + 2], body[p + 3]]);
+                            p += 4;
+                            if vlen < 0 { params.push(None); }
+                            else {
+                                let end = (p + vlen as usize).min(body.len());
+                                params.push(Some(String::from_utf8_lossy(&body[p..end]).into_owned()));
+                                p = end;
+                            }
+                        }
+                    }
+                }
+                conn.portals.insert(portal, (sql, params));
+                reply.extend(pg_bind_complete());
+            }
+            b'D' => {
+                let kind = body[0];
+                let name = pg_cstring_at(&body, 1);
+                let sql = match kind {
+                    b'S' => conn.statements.get(&name).cloned().unwrap_or_default(),
+                    _ => conn.portals.get(&name).map(|(s, _)| s.clone()).unwrap_or_default(),
+                };
+                reply.extend(pg_msg(b't', &pg_i16be(0)));
+                if pg_returns_rows(&sql) {
+                    if sql.trim().to_lowercase() == "select 1" {
+                        reply.extend(pg_row_description(&[pg_int4col("n")]));
+                    } else if sql.to_lowercase().contains("count(*)") {
+                        reply.extend(pg_row_description(&[pg_int4col("count")]));
+                    } else {
+                        reply.extend(pg_row_description(&[pg_int4col("id"), pg_textcol("name")]));
+                    }
+                } else {
+                    reply.extend(pg_no_data());
+                }
+            }
+            b'E' => {
+                let portal = pg_cstring_at(&body, 0);
+                let (sql, params) = conn.portals.get(&portal).cloned().unwrap_or_default();
+                let mut d = db.lock().unwrap();
+                let (payload, tx) = pg_run_query(&mut d, &sql, &params, conn.in_tx);
+                conn.in_tx = tx;
+                reply.extend(payload);
+            }
+            b'S' => { reply.extend(pg_ready_for_query(if conn.in_tx { b'T' } else { b'I' })); }
+            b'C' => { reply.extend(pg_msg(b'3', &[])); }
+            b'H' => {}
+            b'X' => {
+                if conn.in_tx {
+                    let mut d = db.lock().unwrap();
+                    if let Some((rows, next)) = d.snapshot.take() { d.rows = rows; d.next_id = next; }
+                    d.tx_note("ROLLBACK(dropped)");
+                }
+                return;
+            }
+            _ => {
+                reply.extend(pg_error_response("08P01", "protocol violation"));
+                reply.extend(pg_ready_for_query(if conn.in_tx { b'T' } else { b'I' }));
+            }
+        }
+        if reply.is_empty() { continue; }
+        if stream.write_all(&reply).is_err() { return; }
+        stream.flush().ok();
+    }
+}
+
+/// Start a fresh desk; return its port. Given.
+fn md_pg_desk() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let db: PgShared = Arc::new(Mutex::new(PgDb { next_id: 1, ..PgDb::default() }));
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let db = Arc::clone(&db);
+            std::thread::spawn(move || pg_handle(stream, db));
+        }
+    });
+    port
+}
+
+/// The one-true pool builder. Given.
+async fn md_pool_on(port: u16) -> sqlx::PgPool {
+    let opts = sqlx::postgres::PgConnectOptions::new()
+        .host("127.0.0.1")
+        .port(port)
+        .username("desk")
+        .database("desk");
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(5)
+        .acquire_timeout(std::time::Duration::from_secs(5))
+        .connect_with(opts)
+        .await
+        .unwrap()
+}
+
+// ---- the first exercises: is each desk alive? ----
+
+/// GET `base` + `path` with the blocking client; return the status as u16.
+fn md_feed_status(base: &str, path: &str) -> u16 {
+    todo!()
+}
+
+/// Open the cache at `url`, send PING, return the reply ("PONG").
+async fn rd_pong(url: &str) -> String {
+    todo!()
+}
+
+/// Open a pool on `port` and return the row count of `t` (0 on a fresh desk).
+async fn pg_count(port: u16) -> i32 {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let (base, _log) = md_url_desk();
+let rurl = md_redis_desk();
+let pg_port = md_pg_desk();
+assert_eq!(md_feed_status(&base, "/ok"), 200, "the feed desk answers");
+assert_eq!(md_feed_status(&base, "/missing"), 404, "404 is data, not an error (§17)");
+let rt = tokio::runtime::Runtime::new().unwrap();
+let pong = rt.block_on(rd_pong(&rurl));
+assert_eq!(pong, "PONG", "the cache desk speaks RESP2");
+let n = rt.block_on(pg_count(pg_port));
+assert_eq!(n, 0, "the store desk's table starts empty");
+println!("Exercise 1.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 2. The Spine: Fill, Quote, ServiceError
+
+The boundary structs and the one error enum are given — §2.1 of the example notebook verbatim. The exercises: drive the decode, read the layering, apply the exit contract.
+
+**See**: §2 of the example notebook.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 2.1 Given: the spine — do not modify. Three crates, one enum.
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct MdFill {
+    sym: String,
+    px: f64,
+    qty: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct MdQuote {
+    sym: String,
+    px: f64,
+}
+
+#[derive(Debug, PartialEq)]
+enum MdServiceError {
+    Feed(String),
+    Cache(String),
+    Store(String),
+}
+
+impl std::fmt::Display for MdServiceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MdServiceError::Feed(m) => write!(f, "feed: {m}"),
+            MdServiceError::Cache(m) => write!(f, "cache: {m}"),
+            MdServiceError::Store(m) => write!(f, "store: {m}"),
+        }
+    }
+}
+
+impl From<reqwest::Error> for MdServiceError {
+    fn from(e: reqwest::Error) -> Self {
+        MdServiceError::Feed(e.to_string())
+    }
+}
+
+impl From<redis::RedisError> for MdServiceError {
+    fn from(e: redis::RedisError) -> Self {
+        MdServiceError::Cache(e.to_string())
+    }
+}
+
+impl From<sqlx::Error> for MdServiceError {
+    fn from(e: sqlx::Error) -> Self {
+        match &e {
+            sqlx::Error::Database(db) => MdServiceError::Store(format!(
+                "{} ({})",
+                db.message(),
+                db.code().unwrap_or_default()
+            )),
+            other => MdServiceError::Store(other.to_string()),
+        }
+    }
+}
+
+/// Decode a batch of fills from raw JSON; a decode failure is a Feed
+/// error carrying serde's message (the boundary names its crate).
+fn decode_batch(raw: &str) -> Result<Vec<MdFill>, MdServiceError> {
+    todo!()
+}
+
+/// The layer that failed, machine-readable: "feed", "cache", or "store".
+fn layer_of(e: &MdServiceError) -> &'static str {
+    todo!()
+}
+
+/// The exit contract: Ok -> 0, Err -> 1.
+fn exit_code_of(r: &Result<(), MdServiceError>) -> i32 {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let fills = decode_batch(r#"[{"sym":"AAA","px":10.0,"qty":100},{"sym":"BBB","px":20.5,"qty":200}]"#).unwrap();
+assert_eq!(fills.len(), 2);
+assert_eq!(fills[1], MdFill { sym: "BBB".to_string(), px: 20.5, qty: 200 });
+let e = decode_batch("not json at all").unwrap_err();
+assert_eq!(layer_of(&e), "feed");
+assert!(e.to_string().starts_with("feed: "), "the layer names itself: {}", e);
+assert_eq!(layer_of(&MdServiceError::Cache("down".to_string())), "cache");
+assert_eq!(layer_of(&MdServiceError::Store("42P01".to_string())), "store");
+assert_eq!(exit_code_of(&Ok(())), 0);
+assert_eq!(exit_code_of(&Err(e)), 1);
+println!("Exercise 2.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 3. Stage 1 + 2: Ingest, Cache-Aside
+
+Ingest is the blocking client (§17); cache-aside is GET → miss → origin → SET EX → hit (§18.9) — with the origin call **outside** the runtime, because blocking inside `block_on` panics (the example notebook's own §3.1 caught it live).
+
+**See**: §3 of the example notebook.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 3.1 Given: the origin fetch — a plain blocking fn, never called inside a
+// runtime (chapter 16's rule). Do not modify.
+fn md_origin_quote(base: &str, sym: &str) -> Result<MdQuote, MdServiceError> {
+    let v: serde_json::Value = reqwest::blocking::get(format!("{}/json", base))
+        .map_err(MdServiceError::from)?
+        .json()
+        .map_err(MdServiceError::from)?;
+    if v["sym"].as_str() != Some(sym) {
+        return Err(MdServiceError::Feed(format!("desk has no quote for {sym}")));
+    }
+    Ok(MdQuote { sym: sym.to_string(), px: v["px"].as_f64().unwrap_or(0.0) })
+}
+
+// AsyncCommands: the trait behind con.get/set_ex (first use; persists below)
+use redis::AsyncCommands;
+
+/// Stage 1: GET `base`/fills and decode the batch (reqwest + serde, errors
+/// through the spine).
+fn ingest(base: &str) -> Result<Vec<MdFill>, MdServiceError> {
+    todo!()
+}
+
+/// Stage 2a: store `q` at `key` with a 120s TTL (set_ex — write and arm in
+/// one command). Errors through the spine.
+async fn store_quote(con: &mut redis::aio::MultiplexedConnection, key: &str, q: &MdQuote) -> Result<(), MdServiceError> {
+    todo!()
+}
+
+/// Stage 2b: read `key` as Option<MdQuote> — None when absent, decoded
+/// quote when present. Errors through the spine.
+async fn fetch_quote(con: &mut redis::aio::MultiplexedConnection, key: &str) -> Result<Option<MdQuote>, MdServiceError> {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let (base, log) = md_url_desk();
+let rurl = md_redis_desk();
+let fills = ingest(&base).unwrap();
+assert_eq!(fills.len(), 2, "stage 1: the batch decoded");
+assert_eq!(fills[0].sym, "AAA");
+
+// the miss path: origin FIRST (outside any runtime), then store, then hit
+let origin_before = log.lock().unwrap().iter().filter(|l| *l == "GET /json").count();
+let q = md_origin_quote(&base, "SPIRE").unwrap();
+assert_eq!(q.px, 101.5);
+let rt = tokio::runtime::Runtime::new().unwrap();
+rt.block_on(async {
+    let client = redis::Client::open(rurl.as_str()).unwrap();
+    let mut con = client.get_multiplexed_tokio_connection().await.unwrap();
+    let key = "p:quote:SPIRE";
+    assert_eq!(fetch_quote(&mut con, key).await.unwrap(), None, "cold cache");
+    store_quote(&mut con, key, &q).await.unwrap();
+    let hit = fetch_quote(&mut con, key).await.unwrap();
+    assert_eq!(hit.as_ref(), Some(&q), "the hit decoded to what the miss stored");
+});
+let origin_after = log.lock().unwrap().iter().filter(|l| *l == "GET /json").count();
+assert_eq!(origin_after - origin_before, 1,
+    "cache-aside: the origin saw the miss, not the hit");
+println!("Exercise 3.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 4. Stage 3: Persist in a Transaction
+
+Every insert inside one `begin()`/`commit()`, values bound, drop-is-rollback for the ghost, server refusals wrapped by the spine — and the desk's ledger (`pg_tx_p.log`) as the receipt.
+
+**See**: §4 of the example notebook.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 4.1 The three store paths: commit, drop, refuse.
+// Row: the get accessor on PgRow (first use; persists below)
+use sqlx::Row;
+
+/// Insert every fill's `"{sym}x{qty}@{px}"` tag in ONE transaction
+/// (`&mut *tx` inside the loop), commit, and return the table's row count.
+async fn persist_batch(pool: &sqlx::PgPool, fills: &[MdFill]) -> Result<i32, MdServiceError> {
+    todo!()
+}
+
+/// Begin, insert a "ghost" row, DROP the transaction without committing,
+/// wait 250ms for the automatic rollback, return the row count — the
+/// ghost must not be there.
+async fn ghost_insert(pool: &sqlx::PgPool) -> Result<i32, MdServiceError> {
+    todo!()
+}
+
+/// Run `SELECT * FROM missing` and let `?` convert the server's refusal
+/// through the spine. Return Ok only if the query somehow succeeded.
+async fn refused_sql(pool: &sqlx::PgPool) -> Result<(), MdServiceError> {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let pg_port = md_pg_desk();
+// the batch: ingested OUTSIDE the runtime (the blocking client's drop
+// panics inside one — chapter 16, again, now in check code)
+let fills = ingest(&md_url_desk().0).unwrap();
+let rt = tokio::runtime::Runtime::new().unwrap();
+rt.block_on(async {
+    let pool = md_pool_on(pg_port).await;
+    let n = persist_batch(&pool, &fills).await.unwrap();
+    assert_eq!(n, 2, "both fills committed in one transaction");
+    let n2 = ghost_insert(&pool).await.unwrap();
+    assert_eq!(n2, 2, "the ghost row was rolled back");
+    let err = refused_sql(&pool).await.unwrap_err();
+    assert!(err.to_string().contains("42P01"),
+        "the From impl kept the SQLSTATE: {}", err);
+    assert_eq!(layer_of(&err), "store");
+});
+let ledger = std::fs::read_to_string("pg_tx_p.log").unwrap_or_default();
+let tail: Vec<&str> = ledger.lines().rev().take(5).collect();
+assert!(tail.contains(&"COMMIT"), "the commit is in the ledger: {:?}", tail);
+assert!(tail.iter().any(|l| l.contains("ROLLBACK")), "so is the drop-rollback");
+println!("Exercise 4.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 5. Stage 4: The Pure Kernel
+
+No desks, no awaits, no I/O — the stage a bench would own, unit-asserted with nothing running.
+
+**See**: §5 of the example notebook.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 5.1 The kernel: pure functions over the batch.
+
+/// Volume-weighted average price: sum(px*qty) / sum(qty); None when the
+/// batch has no volume.
+fn vwap(fills: &[MdFill]) -> Option<f64> {
+    todo!()
+}
+
+/// Notional of one fill: px * qty.
+fn notional(f: &MdFill) -> f64 {
+    todo!()
+}
+
+/// The sym of the largest fill by qty.
+fn top_by_qty(fills: &[MdFill]) -> Option<String> {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let probe = vec![
+    MdFill { sym: "AAA".to_string(), px: 10.0, qty: 100 },
+    MdFill { sym: "BBB".to_string(), px: 20.0, qty: 300 },
+];
+assert_eq!(vwap(&probe), Some(17.5));
+assert_eq!(vwap(&[]), None, "an empty batch has no volume to weigh");
+assert_eq!(notional(&probe[0]), 1000.0);
+assert_eq!(top_by_qty(&probe).as_deref(), Some("BBB"));
+let live = vec![
+    MdFill { sym: "AAA".to_string(), px: 10.0, qty: 100 },
+    MdFill { sym: "BBB".to_string(), px: 20.5, qty: 200 },
+];
+let v = vwap(&live).unwrap();
+assert!(v > 10.0 && v < 20.5, "vwap between the two prices: {}", v);
+println!("Exercise 5.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 6. The Façade: run_service
+
+One signature composes all four stages: ingest (blocking, outside any runtime), the async stages under one `block_on`, the kernel inline. Errors flow out as the one enum.
+
+**See**: §6 of the example notebook.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 6.1 The whole pipeline in one signature.
+// Given: the summary the façade returns — do not modify.
+#[derive(Debug, Clone, PartialEq)]
+struct MdSummary {
+    ingested: usize,
+    cached: bool,
+    persisted: i32,
+    vwap: f64,
+}
+
+/// Run stages 1–4 against the three desks: ingest the batch, cache the
+/// SPIRE quote (miss -> origin OUTSIDE the runtime -> store), persist the
+/// batch in one transaction, compute the vwap. Return the summary.
+fn run_pipeline(base: &str, rurl: &str, pg_port: u16) -> Result<MdSummary, MdServiceError> {
+    todo!()
+}
+
+/// Probe a store port WITHOUT panicking on failure: build 1-connection
+/// options with a 300ms acquire budget; Ok(()) when the pool connects,
+/// Err through the spine when it does not.
+async fn probe_store(port: u16) -> Result<(), MdServiceError> {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let (base, _log) = md_url_desk();
+let rurl = md_redis_desk();
+let pg_port = md_pg_desk();
+let s = run_pipeline(&base, &rurl, pg_port).unwrap();
+assert_eq!(s, MdSummary { ingested: 2, cached: false, persisted: 2, vwap: s.vwap },
+    "cold cache on a fresh desk; both fills persisted");
+assert!(s.vwap > 10.0 && s.vwap < 20.5);
+let rt = tokio::runtime::Runtime::new().unwrap();
+assert_eq!(rt.block_on(probe_store(pg_port)), Ok(()), "the live store probes clean");
+let dead = rt.block_on(probe_store(1)).unwrap_err();
+assert!(dead.to_string().starts_with("store: "),
+    "a dead store is the same enum, layer named: {}", dead);
+println!("Exercise 6.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 7. The Surface: A CLI Report
+
+Chapter 07's exit-code contract at service scale: `report` prints and exits 0, a service error exits 1, misuse exits 2.
+
+**See**: §7 of the example notebook.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 7.1 The report line and the three exit codes.
+
+/// Render the summary: "market-data: {n} fills ingested, quote cached={b},
+/// {m} rows persisted, vwap {v:.4}".
+fn md_report(s: &MdSummary) -> String {
+    todo!()
+}
+
+/// The CLI: args "report" + Ok -> print the report, exit 0; "report" +
+/// Err -> eprintln "Error: {e}", exit 1; anything else -> eprintln usage,
+/// exit 2.
+fn md_cli(args: &[String], r: &Result<MdSummary, MdServiceError>) -> i32 {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let s = MdSummary { ingested: 2, cached: true, persisted: 2, vwap: 17.0 };
+assert_eq!(md_report(&s),
+    "market-data: 2 fills ingested, quote cached=true, 2 rows persisted, vwap 17.0000");
+let ok = md_cli(&["report".to_string()], &Ok(s.clone()));
+assert_eq!(ok, 0);
+let bad = md_cli(&["report".to_string()],
+    &Err(MdServiceError::Feed("desk unreachable".to_string())));
+assert_eq!(bad, 1);
+let usage = md_cli(&[], &Ok(s));
+assert_eq!(usage, 2);
+println!("Exercise 7.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 8. Graceful Shutdown
+
+Teardown mirrors construction: the store pool closes before the cache connection, the runtime drops last — and a dropped runtime kills its in-flight tasks (§17.9's receipt, inherited whole).
+
+**See**: §8 of the example notebook.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 8.1 The shutdown order, on real resources.
+
+/// Close the resources in REVERSE order of acquisition and return the
+/// receipt: "closed: store, cache".
+async fn close_all(pool: sqlx::PgPool, con: redis::aio::MultiplexedConnection) -> String {
+    todo!()
+}
+
+/// The shutdown ORDER as data, for the audit log: the resources from last
+/// acquired to first — ["runtime", "cache", "store"] (runtime drops last;
+/// store closes first).
+fn shutdown_order() -> Vec<&'static str> {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let rurl = md_redis_desk();
+let pg_port = md_pg_desk();
+let rt = tokio::runtime::Runtime::new().unwrap();
+let receipt = rt.block_on(async {
+    let client = redis::Client::open(rurl.as_str()).unwrap();
+    let con = client.get_multiplexed_tokio_connection().await.unwrap();
+    let pool = md_pool_on(pg_port).await;
+    close_all(pool, con).await
+});
+assert_eq!(receipt, "closed: store, cache");
+assert_eq!(shutdown_order(), vec!["runtime", "cache", "store"],
+    "teardown mirrors construction");
+println!("Exercise 8.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 9. Mixed Review
+
+Four problems, each from a different corner of the service.
+
+**See**: §3 and §6 of the example notebook (9.1), §4 (9.2), §7–§8 (9.3), §2 and §5 (9.4).
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 9.1 Two pipelines back to back: the cache makes the second pass a hit.
+
+/// Run the §6.1 pipeline TWICE against the same desks. Return (first,
+/// second): the first pass cold-caches (cached=false), the second hits
+/// (cached=true) — same key, live TTL.
+fn twice(base: &str, rurl: &str, pg_port: u16) -> (MdSummary, MdSummary) {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let (base, log) = md_url_desk();
+let rurl = md_redis_desk();
+let pg_port = md_pg_desk();
+let (a, b) = twice(&base, &rurl, pg_port);
+assert_eq!(a.cached, false, "pass one: cold");
+assert_eq!(b.cached, true, "pass two: the TTL is still live");
+assert_eq!(a.persisted, 2, "each pass re-persists the batch");
+assert_eq!(b.persisted, 4, "so pass two doubles the table");
+let json_hits = log.lock().unwrap().iter().filter(|l| *l == "GET /json").count();
+assert_eq!(json_hits, 1, "two passes, ONE origin request — the cache's whole point");
+println!("Exercise 9.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 9.2 A failed batch rolls back to zero.
+
+/// Persist the batch inside a transaction that ALWAYS rolls back
+/// (explicit `rollback()`), then return the table's count — unchanged.
+async fn persist_nothing(pool: &sqlx::PgPool, fills: &[MdFill]) -> Result<i32, MdServiceError> {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let pg_port = md_pg_desk();
+// ingest outside the runtime — same rule as 4.1
+let fills = ingest(&md_url_desk().0).unwrap();
+let rt = tokio::runtime::Runtime::new().unwrap();
+rt.block_on(async {
+    let pool = md_pool_on(pg_port).await;
+    let before: i32 = sqlx::query("SELECT count(*) FROM t")
+        .fetch_one(&pool).await.unwrap().get("count");
+    let after = persist_nothing(&pool, &fills).await.unwrap();
+    assert_eq!(after, before, "the rolled-back batch left no rows");
+});
+println!("Exercise 9.2 passed");
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 9.3 The health check: pipeline, layer, exit — one call.
+
+/// Run the pipeline and report (layer-or-"ok", exit code) — §2.1's
+/// `layer_of` composed over §6.1's pipeline: Ok -> ("ok", 0),
+/// Err -> (layer, 1).
+fn health(base: &str, rurl: &str, pg_port: u16) -> (&'static str, i32) {
+    todo!()
+}
+
+/// The ops decision from the health pair: (layer, exit) -> action.
+/// ("ok", 0) -> "serve"; anything with exit 1 -> "page"; else "usage".
+fn ops_action(h: (&'static str, i32)) -> &'static str {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let (base, _log) = md_url_desk();
+let rurl = md_redis_desk();
+let pg_port = md_pg_desk();
+assert_eq!(health(&base, &rurl, pg_port), ("ok", 0));
+assert_eq!(ops_action(("ok", 0)), "serve");
+assert_eq!(ops_action(("store", 1)), "page");
+assert_eq!(ops_action(("feed", 1)), "page");
+println!("Exercise 9.3 passed");
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 9.4 The audit receipt: ingest-to-exit, asserted end to end.
+
+/// The full audit: run the pipeline, then return the receipt triple
+/// (origin_requests, vwap_band, exit) where origin_requests is the count
+/// of GET /json the pass added to `log`, vwap_band is "in" when the
+/// summary's vwap is strictly between 10.0 and 20.5 (else "out"), and
+/// exit is 0 on success.
+fn audit_pass(base: &str, log: &std::sync::Arc<std::sync::Mutex<Vec<String>>>, rurl: &str, pg_port: u16) -> (usize, &'static str, i32) {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let (base, log) = md_url_desk();
+let rurl = md_redis_desk();
+let pg_port = md_pg_desk();
+let (origin, band, exit) = audit_pass(&base, &log, &rurl, pg_port);
+assert_eq!(origin, 1, "one cold pass, one origin request");
+assert_eq!(band, "in", "vwap between the two fill prices");
+assert_eq!(exit, 0);
+println!("Exercise 9.4 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 10. What Comes Next
+
+| Next | What it borrows from here |
+|---|---|
+| **The series is complete.** | Twenty-two chapters: every notebook gated 0 errors / 0 warnings / exit 0 in `_e`, every exercise harness-solved in `_p`, every claim probe-verified before it was taught. The capstone's receipt is the series': no new concepts — and every old one working together, on a real wire. |
+
+Carry forward: **the namespace is the architecture; values are bound, never formatted; the transaction is a value whose drop is a rollback; the kernel stays pure; the exit is honest; teardown mirrors construction.**
+</VSCode.Cell>

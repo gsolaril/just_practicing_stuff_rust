@@ -1,0 +1,727 @@
+<VSCode.Cell language="markdown">
+# Rust 115: Data Types and Their Libraries
+
+Chapter 15, and the chapter where the track changes shape: everything through chapter 14 was the *language* — syntax, ownership, traits, modules, the pointer contracts — and this is the first chapter about **libraries you consume**. The domain is deliberately concrete: **time** (the classic "surely a timestamp is just a number" trap), **exact money** (where `f64` is quietly wrong), **identifiers** (where "just make a random string" leaks structure), and **columnar data** (the Rust answer to Python's pandas). The thesis: a representation is a *decision* — which type you pick for a price, an order id, or a table determines what your code can express before the first function is written — and the ecosystem's job is to have made these decisions well, so you adopt them instead of reinventing them.
+
+Everything here is a **runnable example**. Read the markdown, run the cell below it, and change nothing — the practice twin of this notebook is `15_data-types-and-their-libraries_p.ipynb`.
+
+## Who this is written for
+
+You are assumed to be a competent programmer arriving from Python and C++. Python's datetime module and pandas are old friends; C++ taught you that `<chrono>` and a JSON timestamp are different worlds. What is new in Rust: the standard library owns *only* the machine's view of time (`SystemTime`, `Instant`, `Duration` — no calendars, no zones), so **every calendar question goes through a crate**, and the two contenders (`chrono` and `time`) solve the same problem with different philosophies — one runtime-flexible, one compile-time-descriptive. Money has no std answer at all; `rust_decimal` is a 96-bit integer with a scale, not a float. And tabular data is *not* arrays-of-structs by default the way pandas made it feel — polars is a deliberate import at the boundary where columnar wins.
+
+## How to read this notebook
+
+- Markdown cells explain; code cells demonstrate. **Run each code cell as you reach it.** Cells are independent — no sandbox, no files touched, so restart-and-run-from-the-top always works.
+- Code that intentionally *fails* is shown as a comment, together with the diagnostic you would get. §13 is the catalogue.
+- The running domain is a trading desk: fills with prices and timestamps, positions with symbols, a blotter that wants to be a table. Every crate here earns its place on that domain.
+- One honesty note runs through the chapter: `?` at statement level works in evcxr's cell wrapper but not in the offline validator's `fn main() -> ()`, so the cells spell `.unwrap()` — the *types* still force the fallibility into the open, which is the pedagogical point.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+### Contents
+
+- [0. Notebook Conventions: Crates in a Notebook](#0-notebook-conventions-crates-in-a-notebook)
+- [1. Time Is a Domain Problem](#1-time-is-a-domain-problem)
+- [2. Two Ways to Say "Duration"](#2-two-ways-to-say-duration)
+- [3. Chrono vs `time`: Two Crates, Same Problem](#3-chrono-vs-time-two-crates-same-problem)
+- [4. Formatting and Parsing: The Boundary of Every System](#4-formatting-and-parsing-the-boundary-of-every-system)
+- [5. Time Zones: The Same Instant, Different Walls](#5-time-zones-the-same-instant-different-walls)
+- [6. Exact Money: `rust_decimal`](#6-exact-money-rust_decimal)
+- [7. Identifiers: `uuid`](#7-identifiers-uuid)
+- [8. The Row World and the Column World](#8-the-row-world-and-the-column-world)
+- [9. Polars: Filter, Select, Sort](#9-polars-filter-select-sort)
+- [10. Polars: `group_by` Aggregation](#10-polars-group_by-aggregation)
+- [11. Tables Move as CSV: The Roundtrip](#11-tables-move-as-csv-the-roundtrip)
+- [12. Choosing Representations Before Libraries](#12-choosing-representations-before-libraries)
+- [13. Reading the Compiler: E-Codes](#13-reading-the-compiler-e-codes)
+- [14. Mental Model: The Receipts](#14-mental-model-the-receipts)
+- [15. Cheat Sheet](#15-cheat-sheet)
+- [16. Review](#16-review)
+
+If you are returning to this chapter later, §15 is the one-page summary, §13 the diagnostics catalogue, and §12 the judgment call the whole chapter exists to train.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 0. Notebook Conventions: Crates in a Notebook
+
+This notebook runs on the **evcxr** kernel, which wraps each cell into a generated program and compiles it incrementally. Three consequences matter for every cell below:
+
+- **There is no `fn main`.** The kernel supplies one; you are typing its body.
+- **State persists across cells.** A `let` from cell 2 is still live in cell 20 — including `use` statements.
+- **Items are order-independent, statements are not.** Two `fn`s may call each other regardless of order; two `let`s may not use each other's names before they run.
+
+There is **one namespace per notebook**. Two items with the same name collide exactly as they would in one source file, even in different sections. Every struct and function name below is unique across the notebook — a re-declaration is the same redefinition error as a re-`fn` (E0428). If you re-run a cell that defines an item, it is redefined; on a redefinition error, restart the kernel and run from the top.
+
+### `:dep`, and the one `use` rule
+
+Chapter 09's `:dep` magic is back, now for five crates at once — and one `use` rule from chapter 14's gates deserves its own headline: **the first cell that needs a name does that crate's `use`; later cells rely on persistence.** A repeated `use` line in a later cell is a re-import — E0252, the same shape as a re-declared item.
+
+A failing cell does not poison the kernel — the deliberate compile errors in this chapter are comments, so every cell still runs.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 0.1 The chapter's crate cell: run once per kernel session, features included.
+:dep chrono = "0.4"
+:dep time = { version = "0.3", features = ["macros", "formatting", "parsing"] }
+:dep uuid = { version = "1", features = ["v4"] }
+:dep rust_decimal = "1"
+:dep polars = { version = "0.55", features = ["lazy", "csv", "temporal", "strings"] }
+
+let smoke = uuid::Uuid::nil();
+assert_eq!(smoke.to_string(), "00000000-0000-0000-0000-000000000000");
+println!("crates loaded: chrono, time, uuid, rust_decimal, polars");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+The feature flags are the chapter's first representational lesson in miniature. `uuid` without `v4` has `new_v4` *compiled out* — the ability to generate an id is a feature you request, not a given. `time` without `formatting`/`parsing` cannot format or parse at all, and without `macros` the `format_description!` compile-time builder of §3 does not exist. `polars` is a *family* — `lazy` (§9–§10), `csv` (§11), `temporal`, `strings` — and the family you ship is the binary you pay for. Re-`:dep` with different features is a rebuild; changing features means restart the kernel and run from the top.
+
+## 1. Time Is a Domain Problem
+
+The standard library's `SystemTime` is a duration since an epoch — a machine's answer. It has no months, no weekdays, no calendar rules, and deliberately so: leap years and time zones are *policy*, and policy belongs to maintained libraries. The moment your problem says "the February 29 settlement" or "trading days", you have left std. `chrono`'s answer is a family of types sorted by how much they know: `NaiveDate`/`NaiveDateTime` are calendar-only (no zone), `DateTime<Utc>` and `DateTime<FixedOffset>` are calendar-plus-zone, and construction is **fallible by design** — `from_ymd_opt` returns `Option`, because "February 30" is not a date and `2023-02-29` is not a leap day. The API will not let a typo become a timestamp.
+
+One trait note the kernel taught the hard way: `weekday()` and friends live on the **`Datelike`** (and `Timelike`) traits — import the trait or the method is invisible.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 1.1 A concrete date: validated construction, calendar facts, a parsed equal.
+// with_ymd_and_hms lives on the TimeZone trait
+use chrono::TimeZone;
+
+let settlement = chrono::Utc.with_ymd_and_hms(2026, 9, 29, 12, 0, 0).unwrap();
+// NaiveDate::from_ymd_opt: "February 30" is None, not a panic and not a wrap
+assert_eq!(chrono::NaiveDate::from_ymd_opt(2026, 2, 30), None);
+assert_eq!(chrono::NaiveDate::from_ymd_opt(2026, 2, 29), None); // 2026 is not a leap year
+assert!(chrono::NaiveDate::from_ymd_opt(2028, 2, 29).is_some()); // 2028 is
+// weekday() lives on the Datelike trait
+use chrono::Datelike;
+assert_eq!(settlement.weekday(), chrono::Weekday::Tue);
+assert_eq!((settlement.year(), settlement.month(), settlement.day()), (2026, 9, 29));
+// a timestamp is an instant: parsing the same moment from text is `==`
+let from_wire: chrono::DateTime<chrono::Utc> =
+    serde_style_wire_string().parse().unwrap();
+assert_eq!(from_wire, settlement);
+fn serde_style_wire_string() -> String {
+    "2026-09-29T12:00:00Z".to_string()
+}
+println!("settlement: {} ({})", settlement.format("%Y-%m-%d %H:%M:%S"), settlement.weekday());
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+Three reads on that cell. **The `Option` constructors are the calendar's compiler**: `2026-02-30` and `2026-02-29` both return `None` — the library refuses to manufacture a moment that never happened, which is exactly the check a `SystemTime`-from-integer pipeline never performs. **`Datelike` is the key to the field methods**: without `use chrono::Datelike`, `settlement.weekday()` does not resolve — chapter 10's trait-visibility lesson wearing a chrono badge. **The `==` at the end is the deep fact**: `from_wire` was *parsed from text* and `settlement` was *built from fields*, and they compare equal — a `DateTime` is a value, an instant, not a string wearing a type. §5 will make that equality survive a time-zone change.
+
+## 2. Two Ways to Say "Duration"
+
+Two `Duration` types now live in your head, and confusing them is the classic chrono bug. **`std::time::Duration`** is the machine's span: `u64` seconds plus `u32` nanos, *unsigned* — it cannot say "30 minutes ago", only "30 minutes". **`chrono::TimeDelta`** (the type `chrono::Duration` has aliasised to since 0.4.35) is the *calendar arithmetic* span: signed, so `TimeDelta::hours(-8)` is a real value, and it converts to `std::time::Duration` only when non-negative (`to_std` returns `Option`/`Result` precisely because "negative" has no std representation). DateTimes subtract to `TimeDelta`; a `TimeDelta` added to a `DateTime` does **calendar-aware** arithmetic — adding 30 hours to a day boundary rolls the *date*, which an epoch-seconds add would do correctly by accident but a "days" field would do wrong by design.
+
+### The signed span, exercised
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 2.2 Duration vs TimeDelta: unsigned machine span, signed calendar span.
+use chrono::TimeDelta;
+let open = chrono::Utc.with_ymd_and_hms(2026, 9, 29, 22, 0, 0).unwrap(); // 22:00
+// std's Duration is unsigned: "ahead" only
+let session: std::time::Duration = std::time::Duration::from_secs(90);
+assert_eq!(session.as_secs(), 90);
+// TimeDelta is signed: a negative span is a value, not an error
+let before_open = TimeDelta::hours(-2);
+let earlier = open + before_open;
+assert_eq!(earlier.format("%H:%M").to_string(), "20:00");
+// and a span past midnight rolls the DATE, not just the clock digits
+let day_older = open + TimeDelta::hours(30);
+assert_eq!(
+    (day_older.format("%Y-%m-%d").to_string(), day_older.format("%H:%M").to_string()),
+    ("2026-10-01".to_string(), "04:00".to_string()),
+);
+// DateTime - DateTime is a TimeDelta; here it is exactly a day and a half
+let gap = day_older - earlier;
+assert_eq!(gap, TimeDelta::hours(32));
+// negative TimeDelta has no std form: to_std is honest about it
+assert!(before_open.to_std().is_err());
+assert_eq!(TimeDelta::hours(2).to_std().unwrap(), std::time::Duration::from_secs(7200));
+println!("spans: {} + 30h = {} (date rolled), gap = {}h", open.format("%H:%M"), day_older.format("%d %H:%M"), gap.num_hours());
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+The receipt line says it: 22:00 **+ 30h** lands on `2026-10-01 04:00` — a full day crossed *and* the clock wrapped, with no hand-written `% 24` anywhere. The subtraction came back `TimeDelta::hours(32)` and `num_hours()` read it; the round trip through `to_std()` succeeded only in the non-negative direction. Rule of thumb for the desk: **`std::time::Duration` for timeouts and measurements, `TimeDelta` for anything a human would call "in two hours"** — and never let a `-2 hours` expressible-in-one-type problem get flattened into an error by the other.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 3. Chrono vs `time`: Two Crates, Same Problem
+
+`time` is the second major date-time crate: same domain, different philosophy. Where chrono carries the zone as a *generic parameter* (`DateTime<Tz>`, §5) and formats through runtime `%`-strings, `time` decomposes the problem into orthogonal types — `Date`, `Time`, `PrimitiveDateTime` (date + time, no offset), `OffsetDateTime` (with offset) — and pushes checks toward **compile time**: the month is a `Month` enum, so month 13 is not merely rejected, it is *unrepresentable*; and format templates can be `format_description!` macros checked when the code builds, not when the cell runs. Both crates validate construction (`None`/`Err`, never a silent wrap), both are maintained and battle-tested, and the choice between them is a team decision — but exercising both is what makes either one's documentation readable.
+
+| | chrono | time |
+|---|---|---|
+| the "has a zone" type | `DateTime<Tz>` — zone as generic param | `OffsetDateTime` — offset stored, not generic |
+| the no-zone pair | `NaiveDate` / `NaiveTime` (+ `NaiveDateTime`) | `Date` / `Time` (+ `PrimitiveDateTime`) |
+| months | `u32`, validated at runtime | `Month` enum — 13 cannot be written |
+| format templates | `%Y-%m-%d`-style strings, runtime | format descriptions; `format_description!` is compile-time |
+| spans | `TimeDelta` (§2) | `time::Duration` (signed like `TimeDelta`) |
+| stance | batteries included, extensible zones | lean, compile-time-first |
+
+### The same problem, twice
+
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 3.2 December 25, built in both crates — one problem, two grammars.
+// chrono: numeric month, validated at runtime (2026-13-01 would be None)
+let chrono_date = chrono::NaiveDate::from_ymd_opt(2026, 12, 25).unwrap();
+assert_eq!(chrono_date.weekday(), chrono::Weekday::Fri); // Datelike, imported in §1
+// time: the month is an ENUM — 13 is not a value the type can hold
+let time_date = time::Date::from_calendar_date(2026, time::Month::December, 25).unwrap();
+assert_eq!(time_date.year(), 2026);
+assert_eq!(time_date.weekday(), time::Weekday::Friday);
+// the no-zone combinations, side by side
+let chrono_dt = chrono_date.and_hms_opt(9, 30, 0).unwrap();
+let time_dt = time::PrimitiveDateTime::new(time_date, time::Time::from_hms(9, 30, 0).unwrap());
+assert_eq!(chrono_dt.format("%H:%M").to_string(), "09:30");
+assert_eq!(time_dt.hour(), 9);
+// and both crates' signed spans subtract a day the same way
+let y_ch = chrono_dt - chrono::TimeDelta::days(1);
+let y_t = time_dt - time::Duration::days(1);
+assert_eq!(y_ch.day(), 24);
+assert_eq!(y_t.day(), 24);
+println!("both crates: Dec 25 minus a day is Dec 24 — parallel tables, one grammar each");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+Three reads on that cell. **The month enum is the difference you can feel**: `from_ymd_opt(2026, 13, 1)` returns `None` at *runtime*, while `time::Month::December` makes 13 a thing the type system cannot even name — both are safe, but they are different *philosophies* of safe (validate the value vs make the bad value unwritable), and the track has seen this fork before: chapter 11's error enums vs chapter 08's runtime asserts. **`time::Time::from_hms` still needs its `unwrap`** — in `time`, the `from_*` constructors return `Result` just like chrono's `_opt` family (only the `*_unchecked` variants are infallible), a convention to read carefully in signatures rather than assume. **Everything parallels**: every chrono concept in the table has a time counterpart, so each section of this chapter reads as a translation exercise — which is precisely what makes migrating a codebase between them (or reviewing one that mixes them) a mechanical, checkable chore rather than an adventure.
+
+## 4. Formatting and Parsing: The Boundary of Every System
+
+Formats are the wire. Every trade ticket, log line, CSV cell and API payload carries a moment as **text**, so two operations sit at every system's edge: *formatting* (value → text, for export) and *parsing* (text → value, for import). Both are fallible by design — most strings are not timestamps — and both validate the *calendar*, not just the shape: `2026-09-31` has the right digits and the wrong world, and both crates refuse it at the boundary. The workhorse standard is **RFC 3339** (`2026-09-29T14:32:07Z`): speak the standard at the wire, custom templates inside. chrono speaks it with `to_rfc3339` / `parse_from_rfc3339`; `time` exposes it as a well-known format constant — and its custom templates are compile-time-checked artifacts.
+
+| Task | chrono | time |
+|---|---|---|
+| format, custom | `dt.format("%Y-%m-%d %H:%M:%S")` | `dt.format(&desc)` with a format description |
+| the description | runtime string of `%` specifiers | `format_description!("[year]-[month]-[day] …")` — checked at compile time |
+| format, standard | `to_rfc3339_opts(SecondsFormat::Secs, true)` | `format(&Rfc3339)` |
+| parse, standard | `DateTime::parse_from_rfc3339(s)` | `OffsetDateTime::parse(s, &Rfc3339)` |
+| parse, custom | `NaiveDateTime::parse_from_str(s, fmt)` | `PrimitiveDateTime::parse(s, &desc)` |
+| impossible date | `Err` — never a wrap | `Err` — never a wrap |
+
+### The roundtrip, both directions
+
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 4.2 chrono: strftime-style out, RFC 3339 in and back; impossible date refused.
+let trade = chrono::Utc.with_ymd_and_hms(2026, 9, 29, 14, 32, 7).unwrap();
+let shown = trade.format("%Y-%m-%d %H:%M:%S").to_string();
+assert_eq!(shown, "2026-09-29 14:32:07");
+// the standard wire format, out and back — and the roundtrip is the identity
+let wire = trade.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+assert_eq!(wire, "2026-09-29T14:32:07Z");
+assert_eq!(chrono::DateTime::parse_from_rfc3339(&wire).unwrap(), trade);
+// the calendar is validated at the boundary too: Sept 31 does not exist
+assert!(chrono::DateTime::parse_from_rfc3339("2026-09-31T00:00:00Z").is_err());
+println!("chrono wire format: {}", wire);
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 4.3 time: the format description is a COMPILE-TIME artifact; typos cannot ship.
+use time::macros::format_description;
+let fill = time::OffsetDateTime::from_unix_timestamp(1_790_683_200).unwrap();
+let desc = format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
+assert_eq!(fill.format(&desc).unwrap(), "2026-09-29 12:00:00");
+// roundtrip through the same description — into the offset-less type:
+let back = time::PrimitiveDateTime::parse("2026-09-29 12:00:00", &desc).unwrap();
+assert_eq!(back, time::PrimitiveDateTime::new(fill.date(), fill.time()));
+// the SAME text, SAME description, into OffsetDateTime: refused - no offset in text
+assert!(time::OffsetDateTime::parse("2026-09-29 12:00:00", &desc).is_err());
+// the type decides what the string must contain: "Z" satisfies OffsetDateTime,
+// and the parsed instant IS the offset-less value assumed UTC:
+let rfc = time::OffsetDateTime::parse(
+    "2026-09-29T12:00:00Z",
+    &time::format_description::well_known::Rfc3339,
+);
+assert_eq!(rfc.unwrap(), back.assume_utc());
+// and the impossible date is refused at the boundary, as in chrono:
+assert!(time::Date::parse("2026-09-31", &format_description!("[year]-[month]-[day]")).is_err());
+println!("time: description-format, parse-back equal, offset discipline enforced");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+Two reads spanning both cells. **The failure-timing fork**: chrono's `"%y-%m-%d"` typo compiles and misformats when run — the template is runtime data; `time`'s `format_description!("[yer]-[month]")` does not compile — the template is a macro expansion checked at build time. That is this chapter's recurring pattern in miniature (month enum, `Option` constructors, now typed templates): *push the failure earlier*, and let the compiler be the first test run. **The offset discipline in 4.3 is a type-level lesson**: parsing `"…12:00:00Z"` against an offset-less description *fails*, because the target type — `OffsetDateTime` — demands an offset in the text; the type decides what the string must contain, and the well-known `Rfc3339` constant is the standard-talking door for exactly that. And note what the roundtrips prove in both crates: `parse(format(x)) == x` — equality across construction paths, the property that makes timestamps safe to store, ship and compare.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 5. Time Zones: The Same Instant, Different Walls
+
+A time zone is not a property of a moment — it is a *lens* on one. Chapter 1's cell already proved the deep half: `Utc`-built and `FixedOffset`-built views of the same instant compare `==`, because chrono's zone is a **generic parameter** — `DateTime<Utc>` and `DateTime<FixedOffset>` are different types *sharing one instant*, and `with_timezone` re-lenses without changing what it points at. The other zone family — named IANA zones like `Europe/Paris`, which know DST rules and history — is a separate crate (`chrono-tz`) providing another `TimeZone` implementor; the type system does not care which lens you hand it, only that it implements the trait. The desk's rules fall straight out: **store and compute in UTC** (one timeline), **convert to a zone only at the display or jurisdiction boundary**, and never — *never* — store a local wall time without its offset.
+
+### One instant, three lenses
+
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 5.2 with_timezone: same instant, three lenses, one comparison truth.
+// TimeZone is already imported from §1 — re-using it here would be E0252
+use chrono::FixedOffset;
+let instant = chrono::Utc.with_ymd_and_hms(2026, 9, 29, 14, 0, 0).unwrap();
+let nyc = FixedOffset::east_opt(-5 * 3600).unwrap(); // EST, fixed: no DST here
+let tokyo = FixedOffset::east_opt(9 * 3600).unwrap();
+let nyc_view = instant.with_timezone(&nyc);
+let tokyo_view = instant.with_timezone(&tokyo);
+// same instant, three walls: 14:00 UTC is 09:00 in New York and 23:00 in Tokyo
+assert_eq!(nyc_view.format("%H:%M").to_string(), "09:00");
+assert_eq!(tokyo_view.format("%H:%M").to_string(), "23:00");
+// and the equality is instant-equality, not text-equality:
+assert_eq!(nyc_view, instant);
+assert_eq!(tokyo_view, instant);
+assert_eq!(nyc_view, tokyo_view);
+// the offsets ride along in Display and %z:
+assert_eq!(nyc_view.format("%Y-%m-%d %H:%M %:z").to_string(), "2026-09-29 09:00 -05:00");
+// arithmetic is instant arithmetic, zone-blind:
+let hour_later = instant + chrono::TimeDelta::hours(1);
+assert_eq!(hour_later.with_timezone(&nyc).format("%H:%M").to_string(), "10:00");
+println!("{} UTC = {} in NYC = {} in Tokyo — one instant, three lenses", instant.format("%H:%M"), nyc_view.format("%H:%M"), tokyo_view.format("%H:%M"));
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+The probed `%:z` spelling prints the offset with a colon (`-05:00`) — chrono's formatter has a specifier for the colon itself, one more reason templates are data and deserve the same review as code. The equality chain is the cell's spine: **`nyc_view == instant == tokyo_view`** while all three format differently — *equality on instants, difference on walls*. `FixedOffset::east_opt(-5 * 3600)` also carries the day's first `unwrap`-worthy lesson in miniature: seconds, not hours, are the unit, and out-of-range offsets are `None`. For named zones and DST correctness, the crate to reach for is `chrono-tz` — `Tz::from_str("America/New_York")`, same `with_timezone` calls, DST handled inside the lens; the type-level story you just watched does not change.
+
+## 6. Exact Money: `rust_decimal`
+
+`f64` is a fast, wonderful approximation of a real number, and exactly the wrong type for money: `0.1 + 0.2 != 0.3` in binary floating point — not sometimes, *as a matter of representation* — and a price that prints `0.30000000000000004` is not a rounding nuisance, it is a wrong number. **`rust_decimal`'s `Decimal`** is a different machine: a 96-bit unsigned mantissa plus a `u32` scale — the number `(mantissa, scale)`, read as mantissa × 10⁻ˢᶜᵃˡᵉ, exact to 28 significant digits. Text like `"0.1"` parses to exactly that value; `0.1 + 0.2` is exactly `0.3` and *compares equal to it*; multiplication of two 2-dp numbers is exact to 4 dp; and division that cannot terminate (1 ÷ 3) produces the 28-digit approximation *deliberately, visibly, and away from the exact core*. Financial arithmetic wants exactly this: exact where the world is exact, honest approximation where it must approximate.
+
+### The float trap, and the exact answer
+
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 6.1 The float trap, then Decimal: same arithmetic, different truth.
+use rust_decimal::Decimal;
+use std::str::FromStr;
+// the float fact, demonstrated on this toolchain:
+let float_sum = 0.1_f64 + 0.2_f64;
+assert!(!float_sum.eq(&0.3));
+assert_eq!(float_sum, 0.30000000000000004);
+// the Decimal fact: exact representation, exact sum, exact equality
+let a = Decimal::from_str("0.1").unwrap();
+let b = Decimal::from_str("0.2").unwrap();
+assert_eq!(a + b, Decimal::from_str("0.3").unwrap());
+assert_eq!((a + b).to_string(), "0.3");
+// constructors: from text (scale follows the text) and from parts (mantissa, scale)
+let price = Decimal::from_i128_with_scale(12_345, 2); // 123.45, exactly
+assert_eq!(price.to_string(), "123.45");
+// multiplication ADDS scales: 2dp x integer (scale 0) stays 2dp - exact
+let total = price * Decimal::from(3);
+assert_eq!(total.to_string(), "370.35");
+// two 2dp factors: the scales add to 4 - provenance visible in the digits
+let rate = Decimal::from_str("1.50").unwrap() * Decimal::from_str("2.50").unwrap();
+assert_eq!(rate.to_string(), "3.7500");
+assert_eq!(rate.round_dp(2).to_string(), "3.75");
+println!("float says {} ; decimal says {} (exact)", float_sum, a + b);
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+Two reads on that cell. **The float lines are the proof, not a strawman**: `0.1 + 0.2 == 0.30000000000000004` *on this machine* — the binary fraction cannot represent the decimal fraction, and the error is visible at digit 17. **The scale arithmetic is the mental model**: parse makes scale follow the text (`"0.1"` → 1 dp), `from_i128_with_scale(12_345, 2)` builds from parts (mantissa 12345, scale 2 → `123.45`), multiplication **adds** scales (2 + 0 = 2 → `370.35` when the count carries no scale; 2 + 2 = 4 → `3.7500` when two priced quantities multiply — the provenance is *in the digits*), and `round_dp(2)` is an explicit, named re-scaling to the world's convention — not a hidden fudge. Note what never appears: an epsilon, a `format!("{:.2}", ..)` laundering a wrong value into a pretty string. The value is right *before* it is printed; the format is presentation, not repair.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 6.3 The half-cent boundary: rounding is POLICY, and Decimal makes you name it.
+use rust_decimal::RoundingStrategy;
+// bankers rounding (the default): midpoint goes to the EVEN neighbour
+assert_eq!(Decimal::from_str("2.5").unwrap().round_dp(0).to_string(), "2");
+assert_eq!(Decimal::from_str("3.5").unwrap().round_dp(0).to_string(), "4");
+// half-away-from-zero: the convention most desks and regulators expect
+let half_up = Decimal::from_str("2.675").unwrap()
+    .round_dp_with_strategy(2, RoundingStrategy::MidpointAwayFromZero);
+assert_eq!(half_up.to_string(), "2.68");
+// 1/3 at full precision, then trimmed — the honest approximation, made explicit
+let third = Decimal::from(1) / Decimal::from(3);
+assert_eq!(third.to_string(), "0.3333333333333333333333333333");
+assert_eq!(third.round_dp(4).to_string(), "0.3333");
+// normalization: same value, canonical scale — and equality never needed it
+let fat = Decimal::from_str("370.3500").unwrap();
+assert_eq!(fat.normalize().to_string(), "370.35");
+assert_eq!(fat, Decimal::from_str("370.35").unwrap()); // == compares VALUE, not scale
+println!("1/3 exact-to-28dp = {}; rounded to 4dp = {}; 2.675 half-up = {}", third, third.round_dp(4), half_up);
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+The rounding cell is where the chapter's thesis gets sharp: **`2.5 → 2` and `3.5 → 4` are both correct** — banker's rounding (round-half-to-even, the default) exists because always-rounding-half-up drifts sums upward across millions of operations; but when a regulator or a trading desk says "round half away from zero", `MidpointAwayFromZero` is a *named strategy*, and the code now records which policy it chose. `1 ÷ 3` divides to the full 28 significant digits — the honest limit of the representation — and `round_dp(4)` trims *explicitly*. And note the last assert: `370.3500 == 370.35` — equality compares values, `normalize()` is for canonical *storage/display*, and scale is provenance, not identity. Between 6.1 and 6.3 the full money rule-set: **Decimal for anything priced, `from_i128_with_scale`/parse to build, explicit `round_dp`/strategy at boundaries, f64 only for inputs that were approximations all along** (a volatility, a correlation — never a price).
+
+## 7. Identifiers: `uuid`
+
+An id's job is to be *unique without a coordinator* — no counter to hand out, no database sequence to ask. **UUID version 4** buys that with randomness: 122 random bits, then five version/variant nibbles fixed by the spec so any consumer can recognize the format. The string is always 36 characters — 32 hex digits, 4 hyphens, `8-4-4-4-12` — and the **13th hex digit is the version** (`4`), the **17th the variant** (`8`, `9`, `a` or `b`). Those are not trivia: they are the *structure that remains auditable* — the property "just use a random string" loses, and the reason hand-rolling an id format is a bug before the first id is generated. In Rust the crate is `uuid`, the type is `Uuid`, and it is a **`Copy` 16-byte value**: ids compare by value, hash by value, cross threads by value — and generation needs the `v4` *feature* enabled, §0's first lesson.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 7.2 Generate, inspect, roundtrip: the anatomy is checkable.
+use uuid::Uuid;
+let order_id = Uuid::new_v4();
+let s = order_id.to_string();
+// the format is a contract: 36 chars, hyphens at 8-4-4-4-12
+assert_eq!(s.len(), 36);
+assert_eq!(s.as_bytes()[8], b'-');
+// the spec's fingerprints, readable in the string:
+let hex: String = s.chars().filter(|c| *c != '-').collect();
+let nibbles: Vec<char> = hex.chars().collect();
+assert_eq!(nibbles[12], '4'); // version 4, always
+assert!(matches!(nibbles[16], '8' | '9' | 'a' | 'b')); // variant bits
+assert_eq!(order_id.get_version_num(), 4);
+// value semantics: parse-back is the same VALUE (Uuid: Copy, 16 bytes)
+let back = Uuid::parse_str(&s).unwrap();
+assert_eq!(back, order_id);
+assert_eq!(std::mem::size_of::<Uuid>(), 16);
+assert_eq!(std::mem::size_of_val(&order_id), 16);
+// and the format rejects what is not a UUID — parse is fallible by design
+assert!(Uuid::parse_str("not-a-uuid").is_err());
+println!("order id: {} — version {}, 16 bytes as a value", s, order_id.get_version_num());
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+Three reads on that cell. **The nibble asserts are the spec made executable**: version at digit 13 (`'4'`), variant constrained at digit 17 — run the cell a hundred times, the fingerprints never move; that is what "version 4" *means*, and it is exactly what a home-grown `format!("{}{}{}", a, b, c)` id cannot promise an auditor. **Value semantics are the ergonomic win**: `Uuid` is 16 bytes, `Copy`, `Eq`, `Hash` — ids go into `HashMap`s, cross channels, compare after parse-roundtrips, all as *values*; the string is the display form, not the identity. **`parse_str` returning `Err` is the boundary discipline again** — §4's parser refused impossible dates, this one refuses impossible ids, and both do it with the same shape: `Result`, checked at the edge, trusted inside.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 8. The Row World and the Column World
+
+Before the table library, the *shape* question. Plain Rust's default is the **row world**: one struct per record, operations as loops over `Vec<Trade>` — and it is exactly right at the transaction boundary (§12): a fill arrives whole, gets validated whole, and lands whole. Analysis is where the shape bites: "total notional" reads two fields of every row and touches two `Vec`s' worth of cache lines per field; "the max price" wants the px column alone but must hop rows to get it; and every question is a **different hand-rolled loop**, because a row world has no vocabulary of operations — only per-question functions.
+
+The **column world** stores per-field arrays — symbols together, prices together — so one field's scan is contiguous memory and every question becomes a *composition of column operations*: filter, select, aggregate. That is why pandas exists in Python and why polars exists in Rust: not to replace structs, but to make the analytical world first-class. Polars also fixes two row-world non-answers: a **missing cell is a real value** (`Null` — not a sentinel like `f64::NAN` masquerading as "unknown"), and each column is **typed independently** — `String`, `f64`, `Int64` — with the whole table checked as it is built.
+
+### The row world, honestly — and its cost
+
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 8.1 The row world: the shape every feed, fix and fill actually arrives in.
+struct Trade {
+    symbol: String,
+    price: f64,
+    qty: i64,
+}
+// the one adapter the column world will need in §9: fills in, polars Rows out.
+// Row and AnyValue live OUTSIDE the prelude - their paths are spelled in full.
+// The Row borrows the symbols (Row<'a> tied to `fills`), so it is consumed
+// immediately by from_rows; an owning adapter would clone every symbol String.
+fn blotter_rows(fills: &[Trade]) -> Vec<polars::frame::row::Row<'_>> {
+    use polars::prelude::AnyValue;
+    fills
+        .iter()
+        .map(|t| {
+            polars::frame::row::Row(vec![
+                AnyValue::String(&t.symbol),
+                AnyValue::Float64(t.price),
+                AnyValue::Int64(t.qty),
+            ])
+        })
+        .collect()
+}
+let fills = vec![
+    Trade { symbol: "AAPL".to_string(), price: 228.6, qty: 100 },
+    Trade { symbol: "MSFT".to_string(), price: 418.0, qty: 200 },
+    Trade { symbol: "AAPL".to_string(), price: 229.4, qty: 150 },
+    Trade { symbol: "NVDA".to_string(), price: 121.4, qty: 300 },
+];
+assert_eq!(fills.len(), 4);
+// every analysis question is its own loop in the row world:
+let notional: f64 = fills.iter().map(|t| t.price * t.qty as f64).sum();
+assert!((notional - 177_290.0).abs() < 0.01); // float sums get a tolerance, not ==
+let biggest: &Trade = fills.iter().max_by(|a, b| a.price.partial_cmp(&b.price).unwrap()).unwrap();
+assert_eq!(biggest.symbol, "MSFT");
+// note the partial_cmp dance: floats have no total order - NaN breaks sorting,
+// which is one more reason the column world types each column by its own content
+let row_world_rows = blotter_rows(&fills);
+assert_eq!(row_world_rows.len(), 4); // the adapter speaks Row, not Vec<String>
+println!("row world: {} fills, notional {:.1}, biggest {}", fills.len(), notional, biggest.symbol);
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+Three reads on that cell. **The structs are the boundary, not the enemy**: every fill arrives whole — symbol, price, quantity — and `blotter_rows` is the *only* adapter §9 pays for the column world, mechanical precisely because fields and order match the struct. **The two loops are the row world's true price**: *each new question is new code* — sum and max are two functions today, a third for "counts per symbol" tomorrow, none shared, none composable; note also the `partial_cmp` dance, floats having no total order (`NaN` breaks sorting) — one more reason a column engine re-types the column as its own decision. **§9's questions are already written**: filter, select, sort, aggregate compose; the vocabulary replaces the loops. Keep the structs; hand them a frame when analysis starts.
+
+## 9. Polars: Filter, Select, Sort
+
+**Polars** is the Rust analogue of the pandas slot in a Python workflow: a `DataFrame` — a named, typed set of columns — plus a **lazy engine** that composes operations and optimizes them before running. Construction keeps the row world's boundary honest: `df![..]` builds from explicit columns, and `DataFrame::from_rows_and_schema` consumes *exactly* §8's adapter output **plus a declared schema** — the structs remain the system's intake format, and the frame's column names and types are stated, not guessed (positional rows alone would arrive as anonymous `column_1, column_2, …`). Every cell that touches a table is honest about fallibility (`.unwrap()` per §0) and about identity: column access is by *name*, and a missing name is an error, not a silent empty frame.
+
+The grammar below is the lazy chain: `filter` (rows), `select` (columns), `sort` (order) — each returns a new *plan*, and `collect()` executes it. Read the chain top to bottom like a sentence; that is the column world's whole sales pitch.
+
+### The blotter, as a table
+
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 9.1 The blotter becomes a DataFrame; filter/select/sort compose into one plan.
+// §9 owns the chapter's one glob import (§0's rule): from here on, every cell
+// relies on persistence - a second `use polars::prelude::*` would be E0252
+use polars::prelude::*;
+// from_rows_and_schema: names and types are DECLARED, not inferred - the schema
+// is part of the value, checked as the frame is built. (Positional from_rows
+// alone would call these columns column_1, column_2, ...)
+let blotter_schema = Schema::from_iter([
+    ("sym".into(), DataType::String),
+    ("px".into(), DataType::Float64),
+    ("qty".into(), DataType::Int64),
+]);
+let blotter = DataFrame::from_rows_and_schema(&blotter_rows(&fills), &blotter_schema)
+    .unwrap(); // §8's adapter + this schema = the table
+assert_eq!(blotter.shape(), (4, 3));
+assert_eq!(
+    blotter.get_column_names().iter().map(|n| n.as_str()).collect::<Vec<_>>(),
+    vec!["sym", "px", "qty"]
+);
+assert_eq!(blotter.dtypes(), vec![DataType::String, DataType::Float64, DataType::Int64]);
+// a column's type is the column's own decision:
+let px_col = blotter.column("px").unwrap().f64().unwrap();
+assert_eq!(px_col.len(), 4);
+// the lazy chain: which rows, which columns, what order - collected once
+let big_ticks = blotter
+    .clone()
+    .lazy()
+    .filter(col("px").gt(lit(200.0)))
+    .select([col("sym"), col("px")])
+    .sort(["px"], SortMultipleOptions::default().with_order_descending(true))
+    .collect()
+    .unwrap();
+assert_eq!(big_ticks.shape(), (3, 2)); // MSFT, AAPL, AAPL - NVDA filtered out
+let kept = big_ticks.column("sym").unwrap().str().unwrap();
+assert_eq!(kept.get(0), Some("MSFT"));
+assert_eq!(kept.get(2), Some("AAPL"));
+// and one question polars makes cheap: distinct categories from a string column
+let symbols = blotter
+    .clone()
+    .lazy()
+    .select([col("sym").unique()])
+    .collect()
+    .unwrap();
+assert_eq!(symbols.height(), 3); // AAPL, MSFT, NVDA - three distinct
+println!("{} rows in; {} big ticks out; {} distinct symbols", blotter.height(), big_ticks.shape().0, symbols.height());
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+Three reads on that cell. **The adapter is one function and it already existed**: `DataFrame::from_rows(&blotter_rows(&fills))` — the row world walked into the column world through the door §8 built, and the struct definitions never changed. **The dtype assert is the schema made visible**: `[String, Float64, Int64]` — each column typed by *its own content*, not promoted to a common row type; §8.1's `price: f64` field arrived as a `Float64` *column* and that distinction is the whole shape shift. **The chain reads like the question**: which rows (px > 200), which columns (sym, px), what order (descending) — one plan, one `collect`, and `unique()` thrown in as the kind of question the row world would have made loop number three. What is still missing from the desk's toolkit is the fold — §10.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 10. Polars: `group_by` Aggregation
+
+The lazy chain from §9 composes further: **`group_by` splits the frame into groups by key, `agg` folds each group's columns to one row each** — the column world's "counts per symbol" question, answered with a *plan*, not a loop. Aggregations are given as expressions, `col("qty").sum()`; **`alias` names the computed column** so the result table speaks the desk's language (`total_qty`, not `qty`); and the engine's optimizer does what the hand-rolled loop never thought to: projection pushdown (§9's `select` trims columns *before* the fold), predicate pushdown (filters run before groups), and freedom to parallelize over groups. The result is a table like any other — so aggregations *chain*, pivot into reports, and carry the same typed-column discipline out the other side.
+
+### The desk's first report
+
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 10.1 group_by + agg: per-symbol totals as one composed plan.
+let report = blotter
+    .clone()
+    .lazy()
+    .group_by([col("sym")])
+    .agg([
+        col("qty").sum().alias("total_qty"),
+        col("px").mean().alias("avg_px"),
+    ])
+    .sort(["sym"], SortMultipleOptions::default())
+    .collect()
+    .unwrap();
+assert_eq!(report.shape(), (3, 3)); // AAPL, MSFT, NVDA
+let tq = report.column("total_qty").unwrap().i64().unwrap();
+assert_eq!(tq.get(0), Some(250)); // AAPL: 100 + 150
+// the computed column's type is chosen by the operation: mean is Float64
+assert_eq!(report.column("avg_px").unwrap().dtype(), &DataType::Float64);
+let ap = report.column("avg_px").unwrap().f64().unwrap();
+assert!((ap.get(0).unwrap() - 229.0).abs() < 1e-9); // (228.6 + 229.4) / 2
+// 10.1's big_ticks plan re-derived the frame at 3 rows; group_by reached the same
+// information a third way - and the whole chain stayed a plan until collect()
+println!("per-symbol report: AAPL {} @ avg {:.1}", tq.get(0).unwrap(), ap.get(0).unwrap());
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+Three reads on that cell. **`alias` is API design inside a data pipeline**: unnamed `sum` columns are exactly the "anonymous tuples" anti-pattern of chapter 12's `collect::<Vec<(i32, i32)>>` — the report should *read* like the desk talks. **Types stay per-column end to end**: `sum` keeps `Int64`, `mean` yields `Float64` — the frame's schema is a contract, checked at `collect()` time, and `.i64()`/`.f64()` accessors re-assert it at the read edge. **`group_by` is the composition test passed**: §9's filter/select/sort and §10's group/agg are one grammar, plans compose with plans, and the optimizer sees the whole plan — which is why the rule is **build lazy, collect late**: keep the work a description until the last responsible moment.
+
+## 11. Tables Move as CSV: The Roundtrip
+
+Tables do not live in memory forever — they cross process boundaries as **CSV**: exchange format on the way out, parse discipline on the way back in. Polars' writer is **schema-aware** (headers from names, cell formatting from column types) and its reader **infers the schema from the data** — which is why the roundtrip is the exercise: write to a `Vec<u8>` (no files, per §0's honesty note — this is a boundary demonstration, not a filesystem tour), read the bytes back, and *compare tables*: shape, column names, dtypes — the schema is the thing that must survive the trip. The reader's inference re-derives `String`/`f64`/`Int64` from the cells themselves, so a drifted writer (a mangled header, a locale that prints decimals with commas) fails the comparison instead of silently feeding the next stage garbage.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 11.1 Write the blotter to CSV bytes, read them back, compare schemas.
+let mut buf: Vec<u8> = Vec::new();
+CsvWriter::new(&mut buf).include_header(true).finish(&mut blotter.clone()).unwrap();
+let wire = String::from_utf8(buf).unwrap();
+assert!(wire.starts_with("sym,px,qty\n")); // header row: names, comma-joined
+assert!(wire.contains("AAPL,228.6,100")); // a data row, verbatim
+// read back from the SAME bytes - in-memory, no filesystem involved
+let back = CsvReadOptions::default()
+    .with_has_header(true)
+    .into_reader_with_file_handle(std::io::Cursor::new(wire.clone().into_bytes()))
+    .finish()
+    .unwrap();
+assert_eq!(back.shape(), (4, 3));
+assert_eq!(
+    back.get_column_names().iter().map(|n| n.as_str()).collect::<Vec<_>>(),
+    vec!["sym", "px", "qty"]
+);
+assert_eq!(back.dtypes(), blotter.dtypes()); // the schema survived the trip
+assert_eq!(back.height(), blotter.height()); // so did every row
+// and the roundtrip value is REAL: §10's report runs on the returned table too
+let again = back.lazy().group_by([col("sym")]).agg([col("qty").sum().alias("total_qty")]).collect().unwrap();
+assert_eq!(again.height(), 3);
+println!("csv out: {} bytes, header {:?}; roundtrip schema equal", wire.len(), wire.lines().next().unwrap());
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+The roundtrip's real product is the **comparison**: `back.dtypes() == blotter.dtypes()` and row-for-row height — the *schema* is the contract that survives the trip, exactly the assert a data pipeline should run at every ingest edge before trusting new bytes. Two honesty notes. The writer formatted `px` from its `Float64` column type and the reader *re-inferred* the same three types from cells alone — inference is the reader's bet, and a drifted writer (locale commas, mangled header) loses that bet loudly here instead of silently poisoning §10's report downstream. And the bytes never touched a filesystem — `Vec<u8>` and `Cursor` — because this section is about the *boundary format*, not I/O; chapter 07 owns files, and the same roundtrip works over `File` handles unchanged.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 12. Choosing Representations Before Libraries
+
+The library tour ends where the chapter's title began: **the representation is the decision; the library is the consequence**. Each section picked a type *before* writing logic — timestamp over string, `Decimal` over `f64`, `Uuid` over "a random string", frame over ad-hoc loops — and every downstream correctness property followed from that choice, not from clever code. The table is the chapter's judgment ledger: the domain question, the representation that answers it, and the section that proved it.
+
+| The domain question | The representation | Why it wins | Where |
+|---|---|---|---|
+| "when, exactly?" | `DateTime<Utc>` / `OffsetDateTime` — never a string, never `SystemTime` for calendars | calendar facts + zone lenses + validated construction | §1, §5 |
+| "how long?" | `TimeDelta` for human-spoken spans, `std Duration` for timeouts | signed spans; calendar-aware arithmetic | §2 |
+| "which format does the wire speak?" | RFC 3339 at the edge; typed templates inside | `parse(format(x)) == x`; compile-time-checked in `time` | §4 |
+| "what wall-clock does the user see?" | UTC inside, zone lens at display | one timeline; equality on instants | §5 |
+| "what does this cost?" | `Decimal` — mantissa+scale, exact to 28 digits | `0.1+0.2 == 0.3`; named rounding policy | §6 |
+| "which record is this?" | `Uuid` (v4) — 16 value bytes, spec-fingerprinted | uncoordinated uniqueness with an auditable format | §7 |
+| "the analytical view?" | polars `DataFrame` behind the struct boundary | columns scan contiguous; questions compose | §8–§11 |
+| "a missing cell?" | `Null` as a real value — never a `NAN` sentinel | missing is data, not a float accident | §8, §9 |
+
+### The decision, exercised
+
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 12.1 One fill, represented correctly at every field - the chapter in one struct.
+// (Decimal and FromStr were imported in §6.1 - persistence, not re-import)
+struct Fill {
+    id: uuid::Uuid,                        // §7: identity, 16 value bytes
+    ts: chrono::DateTime<chrono::Utc>,     // §1/§5: the instant, UTC inside
+    symbol: String,                        // §8: the record's own field
+    price: rust_decimal::Decimal,          // §6: exact, policy-rounded at edges
+    qty: i64,                              // §8: the record's own field
+}
+impl Fill {
+    fn notional(&self) -> Decimal {
+        self.price * Decimal::from(self.qty) // exact: 2dp + 0dp = 2dp, no float in sight
+    }
+}
+let f = Fill {
+    id: uuid::Uuid::new_v4(),
+    ts: chrono::Utc.with_ymd_and_hms(2026, 9, 29, 15, 4, 0).unwrap(), // TimeZone in §1
+    symbol: "MSFT".to_string(),
+    price: Decimal::from_str("418.25").unwrap(),
+    qty: 200,
+};
+let notional = f.notional();
+assert_eq!(notional.to_string(), "83650.00"); // 2dp, exact
+assert_eq!(notional.round_dp(0).to_string(), "83650"); // explicit re-scaling
+assert_eq!(f.ts.format("%Y-%m-%d").to_string(), "2026-09-29");
+assert_eq!(f.id.get_version_num(), 4);
+// the wrong-shape alternative, for contrast: notional as f64 (correct here,
+// wrong in general: 0.1-style prices would drift at the 17th digit)
+let float_notional = 418.25_f64 * 200.0;
+assert_eq!(float_notional, 83_650.0); // this one happens to be exact - luck, not design
+println!("fill {} @ {} x{} = {} (exact)", f.symbol, f.price, f.qty, notional.round_dp(2));
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+The cell is small and that is the point: one struct, five fields, **five sections of the chapter expressed as field types**. `notional()` multiplies `Decimal` by `Decimal` — the 2-dp result is exact by *representation* (2 dp price × scale-0 count; scales add), and the float comparison line is there to be honest: this particular product is exact in `f64` *by luck* (`418.25 × 200` survives binary), while `"0.1"`-class prices would not — you do not design around luck. The practice twin drills this judgment per exercise: given a domain question, *choose the field type first*, then defend the choice the way the table above defends each row.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 13. Reading the Compiler: E-Codes
+
+The diagnostics of this chapter are different in kind from chapters 1–14's: several come from **features and traits at the boundary** — the E-code arrives the moment you consume a library you have not fully loaded, or miss the trait that carries the method. Every wording below was captured on this exact toolchain, several probed specifically for this notebook.
+
+| Diagnostic | Trigger | Message (captured / probed) | Fix |
+|---|---|---|---|
+| **E0432** | `use time::macros::…` without the `macros` feature | ``could not find `macros` in `time` `` + ``the item is gated behind the `macros` feature`` | enable the feature: `:dep time = { version = "0.3", features = ["macros", …] }` (§0) |
+| **E0432** | `use chrono::TimeDelta;` before **chrono 0.4.35** | ``unresolved import`` — no such name in older chrono | the alias is new: `Duration` on older versions, `TimeDelta` on 0.4.35+ |
+| **E0599** | `date.weekday()` with no `Datelike` imported | ``no method named `weekday` `` + ``items from traits can only be used if the trait is in scope`` | `use chrono::Datelike;` (also `Timelike` for `.hour()` etc.) — §1.1 |
+| **E0599** | `Uuid::new_v4()` without the `v4` feature | ``no function or associated item named `new_v4` `` | `:dep uuid = { version = "1", features = ["v4"] }` — §0 |
+| **E0433** | `uuid` (or any crate) never `:dep`-loaded | ``failed to resolve: use of unresolved module or unlinked crate `uuid` `` | run the `:dep` cell first; after a kernel restart, from the top (ch09's rule) |
+| **E0252** | the same `use` in two cells | ``the name `X` is defined multiple times`` | the first cell that needs a name does its `use`; later cells rely on persistence (§0) |
+| **E0308** | `assert_eq!(0.1 + 0.2, 0.3);` | ``can't compare `{float}` with `{float}``` — no `PartialEq` for floats in `assert_eq!` | assert the intent: `abs_diff_eq!`/tolerance, or go `Decimal` and compare exactly (§6) |
+| **E0658** | `round_dp(2)` on a `Decimal` behind an *old* rust_decimal | ``see issue #…`` / not found on older versions | pin `rust_decimal = "1"` current; API surface is per-version |
+| **link error** | linking polars without winapi import libs | ``cannot find -lwinapi_ntdll`` | `-L native=<winapi-…>/lib` — the validator's `native=` lines (offline-gate plumbing) |
+
+### The catalogue, exercised
+
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 13.1 Each row dodged once; the boundary lessons compiled into muscle memory.
+// E0432 dodged: features declared at load (§0.1 did it); macros visible.
+// The import lives in §4.3's scoped cell - this cell uses the full macro path:
+let desc = time::macros::format_description!("[year]-[month]-[day]");
+assert_eq!(time::Date::from_ordinal_date(2026, 273).unwrap().format(&desc).unwrap(), "2026-09-30");
+// E0599 dodged: the trait is imported before the trait's method is called
+use chrono::Timelike;
+let t = chrono::Utc.with_ymd_and_hms(2026, 9, 29, 15, 4, 0).unwrap(); // TimeZone from §1
+assert_eq!(t.hour(), 15);
+// E0252 dodged: Datelike imported once (§1.1); §3.2 relied on persistence - as here
+assert_eq!(t.weekday(), chrono::Weekday::Tue);
+// E0599 dodged: uuid's v4 feature is on, so new_v4 exists
+let id = uuid::Uuid::new_v4();
+assert_eq!(id.get_version_num(), 4);
+// E0308 dodged: float equality asserted with tolerance, or exact in Decimal
+assert!((0.1_f64 + 0.2_f64 - 0.3).abs() < 1e-9);
+// (Decimal and FromStr were imported in §6.1 - re-using them here would be E0252,
+// the very row two lines down; the exact-sum assert already ran in §6.1)
+println!("catalogue dodged: features, traits, persistence, tolerance vs exactness");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+The dodge cell ends on the **E0308 lesson in its positive form**: the float world asserts with *tolerance* (`abs_diff_eq!`, §6.1's epsilon comment), the decimal world asserts *exactly* — two legitimate patterns, and the compiler enforces the honesty of both by refusing silent `==` on floats. The offline-gate rows (E0252, the winapi link error) are gate plumbing rather than kernel lessons, and they are in the table for the same reason §0 documents the `use` rule: this notebook is compiled *twice* in this workflow — once by evcxr, once by the validator — and both compilers' rules are the reader's rules now. That closes the catalogue; §14 folds the chapter into one receipts table, and §16 will ask for every row from memory.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 14. Mental Model: The Receipts
+
+| Question | Answer with | Where |
+|---|---|---|
+| "why not `SystemTime` for dates?" | it is a duration since an epoch — no months, no zones; calendars are crates | §1 |
+| "is this date real?" | `from_ymd_opt` → `Option`; the calendar is validated at construction | §1 |
+| "how long until open?" | `TimeDelta` — signed; `-2h` is a value; `to_std` refuses negatives | §2 |
+| "what does the wire speak?" | RFC 3339 at the edge; `parse(format(x)) == x` is the contract | §4 |
+| "typo in my format template?" | chrono: runtime data, review it; `time`: compile-time macro, unshippable | §3, §4 |
+| "same moment in Tokyo?" | a zone is a lens: `with_timezone`; instants compare equal, walls differ | §5 |
+| "does the sum equal 0.3?" | `Decimal`: yes, exactly; `f64`: never promise that | §6 |
+| "rounding at the boundary?" | explicit `round_dp` + a *named* strategy — policy in code | §6 |
+| "is this id well-formed?" | v4's fingerprints: version at hex 13, variant at hex 17; `parse` is fallible | §7 |
+| "rows or columns?" | structs at the boundary; frames for analysis — the adapter is one function | §8, §9 |
+| "what is missing here?" | `Null` — a real value in the column world, not a `NAN` sentinel | §8 |
+| "counts per symbol?" | `group_by` + `agg` + `alias` — a plan, not a loop | §10 |
+| "does the schema survive a trip?" | write CSV, read it back, compare dtypes — the schema is the contract | §11 |
+
+Read the table as the receipts ledger for *adopted* decisions: every library type here is a **decision someone made explicit** — chrono made the zone a type parameter, `time` made the month an enum and the template a macro, `rust_decimal` made the scale part of the number, `uuid` made the format a spec you can assert on, polars made the schema part of the value. Python hides these decisions behind one `datetime` and one `DataFrame`; Rust's ecosystem makes each cost and guarantee a *type you chose* — which is why §12's table, not this one, is the chapter's exam.
+
+## 15. Cheat Sheet
+
+| Task | Code |
+|---|---|
+| load the chapter's crates | `:dep chrono = "0.4"`, `time`+`[macros, formatting, parsing]`, `uuid`+`[v4]`, `rust_decimal = "1"`, `polars`+`[lazy, csv, temporal, strings]` |
+| build an instant from fields | `Utc.with_ymd_and_hms(y, m, d, h, mi, s).unwrap()` |
+| impossible date check | `NaiveDate::from_ymd_opt(2026, 2, 30) == None` |
+| weekday / field reads | `use chrono::Datelike;` then `dt.weekday()`, `.year()`, `.day()` |
+| signed span | `TimeDelta::hours(-2)`; `dt + span` does calendar arithmetic |
+| machine span | `std::time::Duration::from_secs(90)` — unsigned, for timeouts |
+| span between moments | `later - earlier` → `TimeDelta`, `.num_hours()` |
+| format, custom | `dt.format("%Y-%m-%d %H:%M:%S")` |
+| the wire format | `dt.to_rfc3339_opts(SecondsFormat::Secs, true)` / `DateTime::parse_from_rfc3339(s)` |
+| format, `time` crate | `format_description!("[year]-[month]-[day] …")` — compile-time checked |
+| re-lens a zone | `let nyc = FixedOffset::east_opt(-5 * 3600).unwrap(); dt.with_timezone(&nyc)` |
+| exact money | `Decimal::from_str("123.45")` or `from_i128_with_scale(12345, 2)` |
+| money arithmetic | `price * Decimal::from(qty)` — scales add; exact |
+| rounding policy | `.round_dp_with_strategy(2, RoundingStrategy::MidpointAwayFromZero)` |
+| make an id | `:dep uuid = { version = "1", features = ["v4"] }` → `Uuid::new_v4()` |
+| inspect the id | `len() == 36`; `get_version_num() == 4`; version nibble `hex[12]` |
+| parse an id | `Uuid::parse_str(&s)` — `Err` on anything else |
+| row world | `Vec<Trade>` — structs at the boundary; loops per question |
+| into the column world | `DataFrame::from_rows(&rows).unwrap()` behind one adapter fn |
+| build a frame directly | `df!["sym" => ["AAPL"], "qty" => [100_i64]].unwrap()` |
+| ask a question | `.lazy().filter(col("px").gt(lit(200.0))).select([..]).sort([..], opts).collect()` |
+| the report | `.lazy().group_by([col("sym")]).agg([col("qty").sum().alias("total_qty")]).collect()` |
+| move a table | `CsvWriter::new(&mut buf).finish(&mut df)` → `CsvReadOptions` + `Cursor` back |
+| check the trip | `back.dtypes() == original.dtypes()` — schema is the contract |
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 16. Review
+
+Answer from memory; each one is a §-numbered cell away.
+
+1. `SystemTime::now()` and `Utc.with_ymd_and_hms(..)` both name a moment. Which calendar facts can the first *not* answer, and what does that make the standard library's time types for? (§1)
+2. `NaiveDate::from_ymd_opt(2026, 2, 29)` returns `None` and so does month 30. What does the `Option` constructor validate, what would an integer-arithmetic pipeline have produced for those inputs, and which two failure *timings* does the chapter contrast at the format-template level? (§1, §4)
+3. `open + TimeDelta::hours(30)` rolled the date while the clock wrapped. Which `Duration` cannot go negative, what does `to_std()` return for `TimeDelta::hours(-2)`, and what rule of thumb splits the two span types? (§2)
+4. `time::Month::December` cannot hold 13; `from_ymd_opt(2026, 13, 1)` returns `None`. What is the difference between *rejecting a bad value* and *making it unwritable*, and where else in the track did that fork appear? (§3)
+5. `format_description!("[yer]-…")` does not compile; chrono's `"%y-%m-%d"` misformats at runtime. Which crate checks templates when the code builds, and what does that make the *string* in a chrono `format()` call? (§4)
+6. A parser refused `…12:00:00Z` against an offset-less description but accepted it against `Rfc3339`. What does the *type* decide about the string, and what did `parse(format(x)) == x` prove about roundtrips? (§4)
+7. `nyc_view == instant == tokyo_view` while all three format differently. What is the zone in chrono's types (generic param), what does `with_timezone` change and not change, and which crate brings DST-correct named zones? (§5)
+8. `0.1 + 0.2 == 0.3` in `Decimal` and provably not in `f64`. What are Decimal's parts (96-bit mantissa, `u32` scale), what does multiplication do to scales, and why is `round_dp` at a boundary explicit policy rather than a repair? (§6)
+9. `2.5 → 2` and `3.5 → 4` under the default strategy. What is banker's rounding *for*, when do you owe a desk `MidpointAwayFromZero`, and why does `370.3500 == 370.35` hold? (§6)
+10. The id string has `4` at hex position 13 and `8/9/a/b` at 17. What do those nibbles certify, why is `Uuid` a 16-byte `Copy` value rather than a `String`, and what does the fallible `parse_str` protect at the boundary? (§7)
+11. `blotter_rows` adapts `Vec<Trade>` into a frame. Why do structs stay at the boundary, which two polars columns showed per-column types (`String`, `Float64`, `Int64`), and what is `Null` in the column world that a `NAN` sentinel never was? (§8, §9)
+12. The report chain is `group_by → agg → alias → sort → collect`. What does `alias` name, why do sum and mean yield different column types, and what is the optimizer doing while the chain is still a plan (pushdowns — build lazy, collect late)? (§10)
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+### What Comes Next
+
+The representation ledger is written; what follows spends it on machinery and capstone:
+
+| Chapter | Title | What it settles |
+|---|---|---|
+| **16** | **Concurrency and Async/Await** | the wall from ch14's §9 comes down: `Send`/`Sync`, `Mutex`, channels — and the `tokio` runtime that makes async Rust run |
+| 17 | HTTP Clients and WebSockets | reqwest + serde: the wire formats of §4 in motion, frames and fill structs crossing real networks |
+| 18 | Redis | keys with TTLs and pub/sub — the id and timestamp types of this chapter as cache keys and expiry fences |
+
+**Carry forward.** You should now be able to do these without looking anything up:
+
+- say why calendars and zones are crate territory, and reach for `with_ymd_and_hms` + `Datelike` instead of integer arithmetic
+- choose `TimeDelta` vs `std Duration` by asking who speaks the span — a human or a timeout
+- speak RFC 3339 at every boundary and check roundtrips with `parse(format(x)) == x`
+- re-lens an instant with `with_timezone`, keep arithmetic in UTC, display in zones
+- refuse `f64` for money: build `Decimal`s from text or parts, multiply, round with a named strategy
+- generate and audit `Uuid` v4 ids — 36 chars, version nibble, 16 value bytes, fallible parse
+- adapt `Vec<Trade>` into a `DataFrame` with one function and let filter/select/sort/group_by replace the loops
+- write and re-read a table's CSV and compare schemas — the contract that survives the trip
+- for each new domain question, **choose the field type first** and defend it the way §12's table does
+</VSCode.Cell>

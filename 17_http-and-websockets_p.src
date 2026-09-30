@@ -1,0 +1,706 @@
+<VSCode.Cell language="markdown">
+# Rust 117: HTTP Clients and WebSockets — Practice
+
+Companion exercises for `17_http-and-websockets_e.ipynb`. Every section mirrors the section of the same number in the example notebook, and every demonstration cell has an exercise, so a `**See**` reference lands on the exact code that shows the technique.
+
+The checks at the bottom of each cell are the grader. Edit only the `todo!()` bodies; when a cell runs without panicking you will see an `Exercise N.M passed` line.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+### Contents
+
+- [0. How to Complete These Exercises](#0-how-to-complete-these-exercises)
+- [1. The Blocking Client: GET, Status, Headers](#1-the-blocking-client-get-status-headers)
+- [2. POST and Bodies](#2-post-and-bodies)
+- [3. JSON with serde: The Boundary Types](#3-json-with-serde-the-boundary-types)
+- [4. Query Parameters, Headers, Redirects](#4-query-parameters-headers-redirects)
+- [5. Timeouts and the Impatient Client](#5-timeouts-and-the-impatient-client)
+- [6. Streaming a Response Body](#6-streaming-a-response-body)
+- [7. The Async Client](#7-the-async-client)
+- [8. WebSockets: The Handshake](#8-websockets-the-handshake)
+- [9. WebSockets: Streams, Sinks, Messages](#9-websockets-streams-sinks-messages)
+- [10. Blocking vs Async: Choosing at the Boundary](#10-blocking-vs-async-choosing-at-the-boundary)
+- [11. The Live Feed: Reconnect as a Loop](#11-the-live-feed-reconnect-as-a-loop)
+- [12. Mixed Review](#12-mixed-review)
+
+§1–§11 each have exercises for the demonstration cells of the example notebook (§8.1–§8.2 are the *given* local WS server, so §8's exercise is 8.3); §12 mixes corners. §12 of the example notebook is the E-code catalogue.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 0. How to Complete These Exercises
+
+This notebook runs on the same **evcxr** kernel as the example notebook. Three consequences shape how you work:
+
+1. **No `fn main`.** The body of a cell *is* the body of `main`. Type statements directly.
+2. **State persists.** A binding from an earlier cell is visible in every cell below it — including `use` lines.
+3. **Items are order-independent.** A struct or fn may be used above the cell that defines it.
+
+> **Item names must be unique across the whole notebook.** Every cell shares one namespace; two functions with the same name are a redefinition error even in different sections. The exercise names here are unique by construction — do not introduce colliding helpers. The same rule covers `use` lines: the first cell that needs a name is the one that imports; later cells rely on persistence — a repeated `use` is E0252.
+
+### The stub convention
+
+Each exercise cell declares signatures with contract doc comments and a `// --- check (do not modify) ---` block of asserts. The body you must fill in is `todo!()`, which compiles but **panics** when executed. Replace it and re-run; an `Exercise N.M passed` line means you are done.
+
+### Four notes specific to this chapter
+
+- **Every check builds its own network.** The given `desk()` helper (§1.1) starts a fresh local HTTP server on an ephemeral port and returns its base URL; the WS endpoint (§8) parks its runtime in a `OnceLock` the same way the example notebook's §8.2 does. Nothing here touches a real network — no external service can make a check flake.
+- **Async stubs are driven by the check's runtime.** A sync stub builds its own `Runtime` and `block_on`s what it needs; an `async fn` stub is awaited inside the check's `block_on`. Never call the blocking client from inside async code — `reqwest::blocking` panics there by design (§10 of the example notebook).
+- **Turbofish, not inference.** Where a check decodes JSON it names the type: `resp.json::<serde_json::Value>()` — un-annotated `json()` is E0283, the same shape chapter 12's `collect` taught.
+- **The crate cell below is given and must run first** (once per kernel session, features included). A `cannot find crate` diagnostic means it has not run — restart and go from the top.
+
+### Expect warnings until you finish
+
+Three warning families are normal and self-cleaning:
+
+- `unused variable` — every unsolved stub whose parameters are untouched;
+- `unused import` — the `use` lines serving a stub you have not solved yet;
+- **stub-induced dead code** (`never used` / `never constructed`) — given helpers that only a *solution* calls.
+
+Chapter 14's fourth family (`variable does not need to be mutable`) is designed out: no stub takes a `mut` binding parameter. Anything outside these families in your solve is a real smell.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 0.1 The chapter's crate cell: run once per kernel session, features included.
+:dep reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "charset", "stream"] }
+:dep serde = { version = "1", features = ["derive"] }
+:dep serde_json = "1"
+:dep tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake"] }
+:dep futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+:dep tokio = { version = "1", features = ["full"] }
+
+let rt = tokio::runtime::Runtime::new().unwrap();
+let answer = rt.block_on(async { 40 + 2 });
+assert_eq!(answer, 42);
+println!("crates loaded; block_on smoke: {}", answer);
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 1. The Blocking Client: GET, Status, Headers
+
+`send()` returning `Ok` means the transport worked; statuses are data until `error_for_status()` opts into rejection.
+
+**See**: §1 of the example notebook.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// Given: the local HTTP server and its request log, fresh per call. Every
+// exercise below calls desk() to get a base URL of its own.
+use std::sync::{Arc, Mutex};
+
+/// Start a fresh local HTTP server; return (base_url, request_log).
+/// Given: the whole notebook tests against this route table.
+fn desk() -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let log2 = Arc::clone(&log);
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let l = Arc::clone(&log2);
+            std::thread::spawn(move || serve_one(stream, l));
+        }
+    });
+    (format!("http://127.0.0.1:{}", port), log)
+}
+
+/// One connection of the local server. Given.
+fn serve_one(stream: std::net::TcpStream, log: Arc<Mutex<Vec<String>>>) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let mut reader = BufReader::new(match stream.try_clone() { Ok(s) => s, Err(_) => return });
+    let mut line = String::new();
+    if reader.read_line(&mut line).is_err() { return; }
+    let mut parts = line.split_whitespace();
+    let method = parts.next().unwrap_or("").to_string();
+    let path = parts.next().unwrap_or("").to_string();
+    let mut content_len = 0usize;
+    let mut token = String::new();
+    loop {
+        let mut h = String::new();
+        if reader.read_line(&mut h).is_err() { return; }
+        let lower = h.to_ascii_lowercase();
+        if let Some(v) = lower.strip_prefix("content-length:") {
+            content_len = v.trim().parse().unwrap_or(0);
+        }
+        if let Some(v) = lower.strip_prefix("x-spire-token:") {
+            token = v.trim().to_string();
+        }
+        if h.trim().is_empty() { break; }
+    }
+    let mut body = vec![0u8; content_len];
+    if content_len > 0 { reader.read_exact(&mut body).ok(); }
+    log.lock().unwrap().push(format!("{} {}", method, path));
+    let route = path.split('?').next().unwrap_or("").to_string();
+    let (status, ctype, payload): (u16, &'static str, Vec<u8>) = match (method.as_str(), route.as_str()) {
+        ("GET", "/ok") => (200, "text/plain", b"spire local ok".to_vec()),
+        ("GET", "/json") => (200, "application/json", br#"{"sym":"SPIRE","px":101.5}"#.to_vec()),
+        ("GET", "/fills") => (200, "application/json",
+            br#"[{"sym":"AAA","px":10.0,"qty":100},{"sym":"BBB","px":20.5,"qty":200}]"#.to_vec()),
+        ("GET", "/junk") => (200, "application/json", b"not json at all".to_vec()),
+        ("GET", "/redir") => (302, "text/plain", b"".to_vec()),
+        ("GET", "/slow") => { std::thread::sleep(std::time::Duration::from_millis(1500));
+            (200, "text/plain", b"finally".to_vec()) }
+        ("GET", "/error") => (500, "text/plain", b"boom".to_vec()),
+        ("POST", "/echo") => (200, "application/json", body.to_vec()),
+        ("GET", "/q") => (200, "text/plain", format!("path={}", path).into_bytes()),
+        ("GET", "/tok") => (200, "text/plain", format!("token={}", token).into_bytes()),
+        ("GET", "/big") => (200, "application/octet-stream", vec![7u8; 65536]),
+        _ => (404, "text/plain", b"nope".to_vec()),
+    };
+    let mut head = format!("HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n", status, ctype, payload.len());
+    if route == "/redir" { head.push_str("Location: /ok\r\n"); }
+    head.push_str("\r\n");
+    use std::io::Write as _;
+    let mut s = stream;
+    s.write_all(head.as_bytes()).ok();
+    s.write_all(&payload).ok();
+}
+
+/// Fetch `url` and return the raw body text. Send, then read the body —
+/// the client is the free-standing blocking one built inside this fn.
+fn fetch_text(url: String) -> String {
+    todo!()
+}
+
+/// Fetch `url` and report the status as a plain u16.
+fn status_code(url: String) -> u16 {
+    todo!()
+}
+
+/// The opt-in rejection: return Ok(()) only if the server said 2xx.
+/// A 404 or 500 must come back as Err — error_for_status is the bridge.
+fn require_success(url: String) -> Result<(), reqwest::Error> {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let (base, log) = desk();
+assert_eq!(fetch_text(format!("{}/ok", base)), "spire local ok");
+assert_eq!(status_code(format!("{}/ok", base)), 200);
+assert_eq!(status_code(format!("{}/missing", base)), 404);
+assert!(require_success(format!("{}/ok", base)).is_ok());
+assert!(require_success(format!("{}/error", base)).is_err());
+assert_eq!(log.lock().unwrap().len() >= 4, true); // the desk saw every request
+println!("Exercise 1.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 1.2 Given: nothing new — desk() and the blocking client persist.
+
+/// Read the Content-Type header of `url` as a String (empty string if absent).
+/// Header LOOKUP is case-insensitive; the VALUE is bytes until to_str() —
+/// and a missing header must not panic: map the Option.
+fn content_type_of(url: String) -> String {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let (base, _) = desk();
+assert_eq!(content_type_of(format!("{}/json", base)), "application/json");
+assert_eq!(content_type_of(format!("{}/big", base)), "application/octet-stream");
+assert_eq!(content_type_of(format!("{}/ok", base)), "text/plain");
+println!("Exercise 1.2 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 2. POST and Bodies
+
+The builder accumulates; `send()` consumes. `.json(&value)` serializes and sets the content type in one call.
+
+**See**: §2 of the example notebook.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 2.1 Given: desk() persists; serde_json is loaded by the crate cell.
+
+/// POST `body` (raw bytes) to `/echo` and return the response body — the
+/// server replays what you sent, so the round-trip is the assert.
+fn post_raw(base: &str, body: Vec<u8>) -> Vec<u8> {
+    todo!()
+}
+
+/// POST a serde_json Value to `/echo` with the ONE-CALL builder method that
+/// serializes and sets Content-Type, then return the decoded reply.
+fn post_json(base: &str, fill: serde_json::Value) -> serde_json::Value {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let (base, _) = desk();
+let echoed = post_raw(&base, br#"{"sym":"RAW","px":1.0}"#.to_vec());
+assert_eq!(echoed, br#"{"sym":"RAW","px":1.0}"#.to_vec());
+let payload = serde_json::json!({"sym": "JSON", "px": 2.5});
+assert_eq!(post_json(&base, payload.clone()), payload);
+println!("Exercise 2.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 3. JSON with serde: The Boundary Types
+
+Boundary structs are plain, derived, and owned; decode failures are `Err`s at the edge.
+
+**See**: §3 of the example notebook.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 3.1 Given: the boundary struct ships here — derive is the point, not the exercise.
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct Fill {
+    pub sym: String,
+    pub px: f64,
+    pub qty: u32,
+}
+
+/// GET `{base}/fills` and decode the body into Vec<Fill> in ONE chain:
+/// send, unwrap, json::<Vec<Fill>>, unwrap. (Turbofish, not inference.)
+fn fetch_fills(base: &str) -> Vec<Fill> {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let (base, _) = desk();
+let fills = fetch_fills(&base);
+assert_eq!(fills.len(), 2);
+assert_eq!(fills[0], Fill { sym: "AAA".into(), px: 10.0, qty: 100 });
+assert_eq!(fills[1].sym, "BBB");
+println!("Exercise 3.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 3.2 Given: the partial-position type with its optional note.
+#[derive(Debug, Deserialize)]
+pub struct Position {
+    pub sym: String,
+    pub qty: u32,
+    #[serde(default)]
+    pub note: String,
+}
+
+/// Decode `text` into a Position, filling a missing `note` with "" —
+/// return None when a REQUIRED field is absent (the decoder refuses).
+fn parse_position(text: &str) -> Option<Position> {
+    todo!()
+}
+
+/// The dynamic escape hatch: decode `text` into a serde_json Value and
+/// return the `sym` field as a String.
+fn sym_of(text: &str) -> String {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let full = parse_position(r#"{"sym":"AAA","qty":7}"#).unwrap();
+assert_eq!((full.sym.as_str(), full.qty, full.note.as_str()), ("AAA", 7, ""));
+let with_note = parse_position(r#"{"sym":"BBB","qty":9,"note":"restock"}"#).unwrap();
+assert_eq!(with_note.note, "restock");
+assert!(parse_position(r#"{"qty":7}"#).is_none()); // missing `sym`: decoder refuses
+assert_eq!(sym_of(r#"{"sym":"CCC","px":30.25}"#), "CCC");
+println!("Exercise 3.2 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 4. Query Parameters, Headers, Redirects
+
+The server reflects what you sent; redirect policy is named in the builder.
+
+**See**: §4 of the example notebook.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 4.1 Given: the /q and /tok routes reflect queries and the x-spire-token header.
+
+/// GET `{base}/q` with the query pairs applied — the builder method that
+/// percent-encodes for you — and return the reflected body text.
+fn send_query(base: &str, pairs: &[(&str, &str)]) -> String {
+    todo!()
+}
+
+/// GET `{base}/tok` carrying `token` as the x-spire-token request header;
+/// return the reflected body text.
+fn send_token(base: &str, token: &str) -> String {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let (base, _) = desk();
+let seen = send_query(&base, &[("sym", "SPIRE"), ("px", "101.5")]);
+assert!(seen.contains("sym=SPIRE") && seen.contains("px=101.5"), "{}", seen);
+assert_eq!(send_token(&base, "abc123"), "token=abc123");
+println!("Exercise 4.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 4.2 Given: the /redir route answers 302 with Location: /ok.
+
+/// Follow the redirect: return the FINAL url path ("/ok") and final status.
+/// The default policy already follows — just do not disable it.
+fn follow_redirect(base: &str) -> (String, u16) {
+    todo!()
+}
+
+/// Refuse to follow: return the 302 itself with its Location header value.
+/// Build the client with reqwest::redirect::Policy::none().
+fn stop_at_redirect(base: &str) -> (u16, String) {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let (base, _) = desk();
+let (path, status) = follow_redirect(&base);
+assert_eq!(path, "/ok");
+assert_eq!(status, 200);
+let (code, location) = stop_at_redirect(&base);
+assert_eq!(code, 302);
+assert_eq!(location, "/ok");
+println!("Exercise 4.2 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 5. Timeouts and the Impatient Client
+
+A timeout is a who-will-I-wait-for decision recorded in the builder.
+
+**See**: §5 of the example notebook.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 5.1 Given: the /slow route sleeps 1.5s before answering.
+
+/// The patient client: no timeout, wait out /slow, return its body.
+fn wait_it_out(base: &str) -> String {
+    todo!()
+}
+
+/// The impatient client: builder timeout of `ms`, then GET /slow. Return
+/// Ok(body) if it answered in time, Err when the policy fired (it must).
+fn beat_the_clock(base: &str, ms: u64) -> Result<String, ()> {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let (base, _) = desk();
+assert_eq!(wait_it_out(&base), "finally");
+assert!(beat_the_clock(&base, 400).is_err()); // 1.5s sleep cannot beat 400ms
+let quick = desk(); // a fresh desk: /slow of THIS server answers instantly here
+let _ = quick;
+println!("Exercise 5.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 6. Streaming a Response Body
+
+`bytes_stream` hands you the body chunk by chunk; the `stream` feature makes it exist.
+
+**See**: §6 of the example notebook.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 6.1 Given: the /big route serves 64 KiB. Stream it; do not buffer it.
+use futures_util::{SinkExt, StreamExt};
+
+/// Stream `{base}/big` with the ASYNC client and count (bytes, chunks).
+/// You are inside an async block here — every call carries .await.
+async fn stream_big(base: &str) -> (usize, usize) {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let (base, _) = desk();
+let rt = tokio::runtime::Runtime::new().unwrap();
+let (total, chunks) = rt.block_on(stream_big(&base));
+assert_eq!(total, 65536);
+assert!(chunks >= 1);
+println!("Exercise 6.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 7. The Async Client
+
+Same vocabulary, awaited. `join!` overlaps requests on one task; `tokio::time::timeout` adds the per-call deadline.
+
+**See**: §7 of the example notebook.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 7.1 Given: StreamExt/SinkExt persist from §6.1.
+
+/// Fire both GETs concurrently on ONE task — the join! macro — and return
+/// (fills_decoded, body_len). You are inside async; the client is reqwest::Client.
+async fn fetch_pair(base: &str) -> (usize, usize) {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let (base, _) = desk();
+let rt = tokio::runtime::Runtime::new().unwrap();
+let (fills, body_len) = rt.block_on(fetch_pair(&base));
+assert_eq!(fills, 2);
+assert!(body_len > 0);
+println!("Exercise 7.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 7.2 Given: nothing new — timeout comes from tokio's prelude-path.
+
+/// The per-call deadline: run a GET of `url` under a `limit_ms` timeout.
+/// Return Ok(()) if it answered in time, Err if the deadline dropped the
+/// future. You are inside async.
+async fn within_deadline(url: String, limit_ms: u64) -> Result<(), tokio::time::error::Elapsed> {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let (base, _) = desk();
+let rt = tokio::runtime::Runtime::new().unwrap();
+rt.block_on(async {
+    assert!(within_deadline(format!("{}/ok", base), 800).await.is_ok()); // /ok answers fast
+    assert!(within_deadline(format!("{}/slow", base), 200).await.is_err()); // cut at 200ms
+});
+println!("Exercise 7.2 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 8. WebSockets: The Handshake
+
+The handshake is HTTP answered 101; the local endpoint below is the given echo server.
+
+**See**: §8 of the example notebook.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// Given: the local WS echo endpoint, runtime parked in a OnceLock (§8.2 of the
+// example notebook's lesson, pre-applied). One session per cell; drop the stream.
+use std::sync::OnceLock;
+
+static WS_RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+
+fn ws_desk() -> u16 {
+    let rt = WS_RT.get_or_init(|| tokio::runtime::Runtime::new().unwrap());
+    rt.block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = match listener.accept().await {
+                    Ok(x) => x,
+                    Err(_) => break,
+                };
+                tokio::spawn(async move {
+                    let mut ws = match tokio_tungstenite::accept_async(stream).await {
+                        Ok(w) => w,
+                        Err(_) => return,
+                    };
+                    while let Some(msg) = ws.next().await {
+                        match msg {
+                            Ok(m) => {
+                                if m.is_close() {
+                                    use tokio_tungstenite::tungstenite::Message;
+                                    ws.send(Message::Close(None)).await.ok();
+                                    let _ = ws.next().await;
+                                    break;
+                                }
+                                if m.is_text() || m.is_binary() {
+                                    if ws.send(m).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
+        });
+        port
+    })
+}
+
+// 8.3 Connect and certify the handshake: return the response STATUS and the
+// number of response headers. connect_async gives you (stream, response) —
+// drop the stream after reading the response; sessions are per-cell.
+async fn handshake(url: String) -> (u16, usize) {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let port = ws_desk();
+let rt = tokio::runtime::Runtime::new().unwrap();
+let (status, headers) = rt.block_on(handshake(format!("ws://127.0.0.1:{}/feed", port)));
+assert_eq!(status, 101);
+assert!(headers >= 1);
+println!("Exercise 8.3 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 9. WebSockets: Streams, Sinks, Messages
+
+`WebSocketStream` is a Stream + Sink of `Message`s; the echo endpoint round-trips text and binary.
+
+**See**: §9 of the example notebook.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 9.1 Given: the echo endpoint (ws_desk) and the Message type by path.
+
+/// Round-trip the wire: send `payload` as a TEXT frame, receive the echo,
+/// return the echoed text. You are inside async; SinkExt/StreamExt persist.
+async fn echo_text(url: &str, payload: &str) -> String {
+    todo!()
+}
+
+/// Binary twin: send `payload` as a BINARY frame, receive the echo, return
+/// the bytes. into_data() consumes the Message — that is the accessor here.
+async fn echo_binary(url: &str, payload: Vec<u8>) -> Vec<u8> {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let port = ws_desk();
+let rt = tokio::runtime::Runtime::new().unwrap();
+rt.block_on(async {
+    let url = format!("ws://127.0.0.1:{}/feed", port);
+    assert_eq!(echo_text(&url, r#"{"sym":"SPIRE","px":101.5}"#).await, r#"{"sym":"SPIRE","px":101.5}"#);
+    assert_eq!(echo_binary(&url, vec![1u8, 2, 3]).await, vec![1u8, 2, 3]);
+});
+println!("Exercise 9.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 9.2 Given: the echo endpoint replies Close to Close and drains.
+
+/// The close handshake: connect, send Close, await the reply, return true
+/// only if the received frame IS the Close. Forgetting the reply side is
+/// how a socket becomes a reset (ResetWithoutClosingHandshake).
+async fn close_cleanly(url: &str) -> bool {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let port = ws_desk();
+let rt = tokio::runtime::Runtime::new().unwrap();
+let clean = rt.block_on(close_cleanly(&format!("ws://127.0.0.1:{}/feed", port)));
+assert!(clean);
+println!("Exercise 9.2 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 10. Blocking vs Async: Choosing at the Boundary
+
+Each client in its home: blocking in sync fns, async on the runtime — the seam is explicit.
+
+**See**: §10 of the example notebook.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 10.1 Given: desk() persists. One fn per world, called the way it must be.
+
+/// The sync home: fetch `{base}/ok` with the BLOCKING client. No runtime,
+/// no await — a plain fn a CLI's main could call.
+fn sync_home(base: &str) -> u16 {
+    todo!()
+}
+
+/// The async home: fetch `{base}/ok` with the ASYNC client. You are inside
+/// async — every call awaits. A blocking call here would stall the worker.
+async fn async_home(base: &str) -> u16 {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let (base, _) = desk();
+assert_eq!(sync_home(&base), 200);
+let rt = tokio::runtime::Runtime::new().unwrap();
+assert_eq!(rt.block_on(async_home(&base)), 200);
+println!("Exercise 10.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 11. The Live Feed: Reconnect as a Loop
+
+Connect, consume, tear down cleanly, back off, reconnect — with the state that matters living outside the socket.
+
+**See**: §11 of the example notebook.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 11.1 Given: the echo endpoint. Each "session" here is one full round-trip.
+
+/// Run `sessions` full cycles against the echo endpoint: connect, send
+/// `frames_per_session` text frames counting each echoed reply, close
+/// cleanly, and continue. Return (echoed_frames, sessions_completed).
+/// The counter that survives lives OUTSIDE the loop — that is the lesson.
+async fn run_sessions(url: &str, sessions: u32, frames_per_session: u32) -> (u32, u32) {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let port = ws_desk();
+let rt = tokio::runtime::Runtime::new().unwrap();
+let (echoed, done) = rt.block_on(run_sessions(&format!("ws://127.0.0.1:{}/feed", port), 2, 3));
+assert_eq!(done, 2);
+assert_eq!(echoed, 6);
+println!("Exercise 11.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 12. Mixed Review
+
+Four problems, each from a different corner of the chapter.
+
+**See**: §3 and §5 of the example notebook (12.1), §1 and §7 (12.2), §9 (12.3), §6 and §7 (12.4).
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 12.1 Given: the boundary struct and the impatient client, combined.
+
+/// The desk's snapshot: decode /fills into Vec<Fill> under a client-level
+/// timeout of `ms`. Everything (send AND decode) must fit inside the
+/// builder timeout; return None when the policy fired.
+fn snapshot_under_deadline(base: &str, ms: u64) -> Option<Vec<Fill>> {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let (base, _) = desk();
+let snaps = snapshot_under_deadline(&base, 5_000);
+assert_eq!(snaps.unwrap().len(), 2);
+assert!(snapshot_under_deadline(&format!("{}/slow", base), 300).is_none());
+println!("Exercise 12.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 12.2 Given: the /q reflection route and the async client.
+
+/// The audited request: fire the /q GET with the query pairs AND carry
+/// `token` as x-spire-token; return the reflected body. You are inside
+/// async. (The /q reflection proves the query arrived; the token rides
+/// along as the header the server reads.)
+async fn audited_get(base: &str, pairs: &[(&str, &str)], token: &str) -> String {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let (base, _) = desk();
+let rt = tokio::runtime::Runtime::new().unwrap();
+let seen = rt.block_on(audited_get(&base, &[("sym", "MIX"), ("qty", "9")], "tok-77"));
+assert!(seen.contains("sym=MIX") && seen.contains("qty=9"), "{}", seen);
+println!("Exercise 12.2 passed");
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 12.3 Given: the echo endpoint. The framing rule as an exercise.
+
+/// The framed sender: connect once, then for each `frame` in `frames`
+/// send ONE text frame containing its JSON `{"seq":N}` — and read the echo
+/// back BEFORE sending the next (the desk's old wire protocol: one in
+/// flight). Return the echoes concatenated in order, comma-separated.
+async fn framed_roundtrip(url: &str, frames: u32) -> String {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let port = ws_desk();
+let rt = tokio::runtime::Runtime::new().unwrap();
+let got = rt.block_on(framed_roundtrip(&format!("ws://127.0.0.1:{}/feed", port), 3));
+assert_eq!(got, r#"{"seq":0},{"seq":1},{"seq":2}"#);
+println!("Exercise 12.3 passed");
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 12.4 Given: /big and the stream. The bounded download.
+
+/// Download {base}/big as a stream but STOP after `max_bytes` — the
+/// backpressure discipline: return how many bytes you actually pulled
+/// (capped), never buffering the whole body. You are inside async.
+async fn capped_download(base: &str, max_bytes: usize) -> usize {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let (base, _) = desk();
+let rt = tokio::runtime::Runtime::new().unwrap();
+let got = rt.block_on(capped_download(&base, 1024));
+assert!(got <= 1024, "capped at 1024, got {}", got);
+assert!(got > 0, "at least one chunk must arrive (chunks are 8..16KiB)");
+let full = rt.block_on(capped_download(&base, usize::MAX));
+assert_eq!(full, 65536);
+println!("Exercise 12.4 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 13. What Comes Next
+
+| Next | What it borrows from here |
+|---|---|
+| **18 — Redis** | the async client discipline applied to a cache; pub/sub is the WS loop's server-side twin. |
+| **19 — PostgreSQL** | pools are the client-per-task made concrete; transactions must survive await points. |
+| **20 — PyO3** | `requests` returns objects, serde returns *typed* values — the boundary struct is the export. |
+| **21 — Capstone Prep** | §11's loop plus a cache plus storage is the market-data service the capstone assembles. |
+
+Carry forward: **the boundary is a function; every network call is a `Result` with a timeout; the feed is a loop, not a connection.**
+</VSCode.Cell>

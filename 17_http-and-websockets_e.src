@@ -1,0 +1,772 @@
+<VSCode.Cell language="markdown">
+# Rust 117: HTTP Clients and WebSockets
+
+Chapter 17, and chapter 16's machinery gets a job. The applied track begins here: `reqwest` for HTTP (in **both** its blocking and async forms — §10 is about choosing between them, not ranking them), `serde` for JSON at the boundary, `tokio-tungstenite` for WebSockets, and — the chapter's thesis — **everything you cannot trust lives at the network edge, so everything at the edge is a `Result` with an opinion**. A price feed is the running domain: REST snapshots with serde structs, then the live WebSocket feed that replaces polling — with reconnect, because feeds drop. Every request in this chapter runs against a **local server built inside the notebook** (§0), so every cell is deterministic, offline, and honest: the diagnostics shown are the ones the compiler and the library actually produce.
+
+Everything here is a **runnable example**. Read the markdown, run the cell below it, and change nothing — the practice twin of this notebook is `17_http-and-websockets_p.ipynb`.
+
+## Who this is written for
+
+You are assumed to be a competent programmer arriving from Python and C++. `requests` and `websockets` are old friends; C++ taught you libcurl's error codes. What is new in Rust: the client is a **value you configure once and clone freely** (connection pools included); **`serde` is not a JSON library** — it is a description of your data that happens to serialize to JSON today; and the WebSocket is **a `Stream` + `Sink` of `Message`s**, so §16's stream discipline applies to frames. And the default error story is strict: redirects are followed silently, statuses do **not** raise — `error_for_status()` is the opt-in line between "transport worked" and "the server said no".
+
+## How to read this notebook
+
+- Markdown cells explain; code cells demonstrate. **Run each code cell as you reach it.** Cells are independent — no sandbox, no files touched, so restart-and-run-from-the-top always works.
+- Code that intentionally *fails* is shown as a comment, together with the diagnostic you would get. §12 is the catalogue.
+- The running domain is the trading desk: fills and quotes moving over HTTP, then the live feed. Every API here earns its place on that domain.
+- One honesty note runs through the chapter: **the network is simulated locally**. Ports are ephemeral, chosen by the OS per cell; nothing leaves your machine; no test depends on an external service being up.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+### Contents
+
+- [0. Notebook Conventions: The Local Network](#0-notebook-conventions-the-local-network)
+- [1. The Blocking Client: GET, Status, Headers](#1-the-blocking-client-get-status-headers)
+- [2. POST and Bodies](#2-post-and-bodies)
+- [3. JSON with serde: The Boundary Types](#3-json-with-serde-the-boundary-types)
+- [4. Query Parameters, Headers, Redirects](#4-query-parameters-headers-redirects)
+- [5. Timeouts and the Impatient Client](#5-timeouts-and-the-impatient-client)
+- [6. Streaming a Response Body](#6-streaming-a-response-body)
+- [7. The Async Client](#7-the-async-client)
+- [8. WebSockets: The Handshake](#8-websockets-the-handshake)
+- [9. WebSockets: Streams, Sinks, Messages](#9-websockets-streams-sinks-messages)
+- [10. Blocking vs Async: Choosing at the Boundary](#10-blocking-vs-async-choosing-at-the-boundary)
+- [11. The Live Feed: Reconnect as a Loop](#11-the-live-feed-reconnect-as-a-loop)
+- [12. Reading the Compiler: E-Codes](#12-reading-the-compiler-e-codes)
+- [13. Mental Model: The Receipts](#13-mental-model-the-receipts)
+- [14. Cheat Sheet](#14-cheat-sheet)
+- [15. Review](#15-review)
+
+If you are returning to this chapter later, §14 is the one-page summary, §12 the diagnostics catalogue, and §11 the loop every real feed client is built from.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 0. Notebook Conventions: The Local Network
+
+This notebook runs on the **evcxr** kernel, which wraps each cell into a generated program and compiles it incrementally. The standing rules from chapter 16 all hold: no `fn main`, state persists across cells, items are order-independent, one namespace per notebook, first cell that needs a name does the `use`. Four chapter-specific conventions:
+
+- **A cell that wants async creates its runtime and lets it drop** (`Runtime::new()` + `block_on`) — the manual form, because the kernel owns `main`.
+- **The network is local.** §0.2 builds a raw HTTP server on `127.0.0.1:0` — the OS picks a free port — and later cells ask it for that address. §8.1 builds a local WebSocket endpoint the same way. Deterministic, offline, honest.
+- **Handlers live before the cell that uses them.** Items are order-independent, so a helper `fn` defined in §0.1 is callable from §4; statements are not, so address bindings are made in the cell that uses them.
+- **Statuses do not raise.** A 404 or 500 is a perfectly good `Response` — the chapter teaches `error_for_status()` as the explicit bridge.
+
+### The crates
+
+`reqwest` (blocking + json + stream features) is the HTTP client; `serde` + `serde_json` own the boundary types; `tokio-tungstenite` is the WebSocket (client **and**, for our local server, the accept side); `futures-util` supplies the `StreamExt`/`SinkExt` traits every WS loop needs. The `stream` feature is what makes `bytes_stream` exist — §6's entire section is behind a feature flag, chapter 15's lesson again.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 0.1 The chapter's crate cell: run once per kernel session, features included.
+:dep reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "charset", "stream"] }
+:dep serde = { version = "1", features = ["derive"] }
+:dep serde_json = "1"
+:dep tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake"] }
+:dep futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+:dep tokio = { version = "1", features = ["full"] }
+
+// (the free-fn reqwest::blocking::get also exists; the Client form below is the one we use)
+println!("crates loaded: reqwest, serde, serde_json, tokio-tungstenite, futures-util, tokio");
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 0.2 The local HTTP server: a raw std TcpListener that answers a few routes.
+// Handlers spawn per connection; Connection: close keeps the protocol stateless.
+use std::io::{BufRead, BufReader, Read, Write};
+use std::sync::{Arc, Mutex};
+
+/// Route table for the local server. Given: the whole chapter tests against this.
+/// `path` includes any query string; /q reflects it, /tok needs the seen token.
+fn route(method: &str, path: &str, body: &[u8], token: &str) -> (u16, &'static str, Vec<u8>) {
+    let route = path.split('?').next().unwrap_or("");
+    match (method, route) {
+        ("GET", "/ok") => (200, "text/plain", b"spire local ok".to_vec()),
+        ("GET", "/json") => (200, "application/json", br#"{"sym":"SPIRE","px":101.5}"#.to_vec()),
+        ("GET", "/fills") => (200, "application/json",
+            br#"[{"sym":"AAA","px":10.0,"qty":100},{"sym":"BBB","px":20.5,"qty":200}]"#.to_vec()),
+        ("GET", "/junk") => (200, "application/json", b"not json at all".to_vec()),
+        ("GET", "/redir") => (302, "text/plain", b"".to_vec()), // Location added by caller
+        ("GET", "/slow") => { std::thread::sleep(std::time::Duration::from_millis(1500));
+            (200, "text/plain", b"finally".to_vec()) }
+        ("GET", "/error") => (500, "text/plain", b"boom".to_vec()),
+        ("POST", "/echo") => (200, "application/json", body.to_vec()),
+        ("GET", "/q") => (200, "text/plain", format!("path={}", path).into_bytes()),
+        ("GET", "/tok") => (200, "text/plain", format!("token={}", token).into_bytes()),
+        ("GET", "/big") => (200, "application/octet-stream", vec![7u8; 65536]), // 64 KiB
+        _ => (404, "text/plain", b"nope".to_vec()),
+    }
+}
+
+/// One connection: parse the request head, read the body, answer, close.
+fn serve(mut stream: std::net::TcpStream, log: Arc<Mutex<Vec<String>>>) {
+    let mut reader = BufReader::new(match stream.try_clone() { Ok(s) => s, Err(_) => return });
+    let mut line = String::new();
+    if reader.read_line(&mut line).is_err() { return; }
+    let mut parts = line.split_whitespace();
+    let method = parts.next().unwrap_or("").to_string();
+    let path = parts.next().unwrap_or("").to_string();
+    let mut content_len = 0usize;
+    let mut token = String::new();
+    loop {
+        let mut h = String::new();
+        if reader.read_line(&mut h).is_err() { return; }
+        let lower = h.to_ascii_lowercase();
+        if let Some(v) = lower.strip_prefix("content-length:") {
+            content_len = v.trim().parse().unwrap_or(0);
+        }
+        if let Some(v) = lower.strip_prefix("x-spire-token:") {
+            token = v.trim().to_string();
+        }
+        if h.trim().is_empty() { break; }
+    }
+    let mut body = vec![0u8; content_len];
+    if content_len > 0 { reader.read_exact(&mut body).ok(); }
+    log.lock().unwrap().push(format!("{} {}", method, path));
+    let (status, ctype, payload) = route(&method, &path, &body, &token);
+    let mut head = format!("HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n", status, ctype, payload.len());
+    if path.split('?').next().unwrap_or("") == "/redir" {
+        head.push_str("Location: /ok\r\n"); // the redirect target, route-owned
+    }
+    head.push_str("\r\n");
+    stream.write_all(head.as_bytes()).ok();
+    stream.write_all(&payload).ok();
+}
+
+/// Start the local server; return its base URL. Given.
+fn start_server() -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let log2 = Arc::clone(&log);
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let l = Arc::clone(&log2);
+            std::thread::spawn(move || serve(stream, l));
+        }
+    });
+    (format!("http://127.0.0.1:{}", port), log)
+}
+
+let (base, _server_log) = start_server(); // the request log: handy for debugging cells
+println!("local server up at {}", base);
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+The server is ~40 lines and worth reading once: parse the request line, read headers to the blank line, read `Content-Length` bytes, answer with a status line and headers, close. Every subtlety the client side hides — chunked encoding, keep-alive, header casing — is exactly what the client is *for*. The client tests assert against this server's fixed table of routes, which is why the chapter's claims stay true next year.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 1. The Blocking Client: GET, Status, Headers
+
+`reqwest::blocking::Client::new()` is a configured value: connection pool, redirect policy, timeouts. Clone it freely — the pool is shared — and configure it **once** with `Client::builder()` when you need more than defaults. `send()` returns `Result<Response>`; `Response` then offers the body readers (`text()`, `json::<T>()`, `bytes()`), the `status()`, and the `headers()`. The chapter's most important line: **`send()` being `Ok` means the *transport* worked** — a 404 or 500 is `Ok` too; `error_for_status()` converts a non-success status into an `Err`, opt-in. Headers are `HeaderMap`: case-insensitive lookups, values that must be converted with `.to_str()` (they are bytes, not `String`s).
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 1.1 GET: send, status, headers, body — the whole vocabulary.
+let client = reqwest::blocking::Client::new();
+
+let resp = client.get(format!("{}/ok", base)).send().unwrap();
+assert_eq!(resp.status(), reqwest::StatusCode::OK);
+assert!(resp.status().is_success());
+assert_eq!(resp.status().as_u16(), 200);
+// headers are case-insensitive; values are bytes until to_str()
+// (the local /ok route serves text/plain — the table in §0.2 is the truth)
+assert_eq!(resp.headers().get("content-type").unwrap(), "text/plain");
+let status = resp.status(); // read BEFORE the consuming body reader (see §12.2)
+let body = resp.text().unwrap();
+assert!(body.len() > 0);
+println!("GET /ok -> {}, body = {:?}", status, body);
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 1.2 The status contract: 4xx/5xx are Ok responses; error_for_status is the bridge.
+let r404 = client.get(format!("{}/missing", base)).send().unwrap();
+assert_eq!(r404.status().as_u16(), 404);
+let r500 = client.get(format!("{}/error", base)).send().unwrap();
+assert_eq!(r500.status().as_u16(), 500);
+assert!(r500.error_for_status().is_err());
+println!("404 and 500 both arrived as Ok; error_for_status refused the 500");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+Three reads on those cells. **`status()` is data, not control flow** — the response arrived, the connection worked, and the *server's opinion* is a typed value (`StatusCode`) with `is_success()`/`as_u16()` accessors; the failure mode chapter 11 trained you to model is expressed as a `Result` conversion (`error_for_status`), not an exception you might forget to catch. **Header lookup is case-insensitive because the spec says so** — `"content-type"` matches `Content-Type:` on the wire — but the *value* is still raw bytes: `.to_str()` is the explicit acknowledgment that some headers are not UTF-8. **`text()` consumes the response** — the body readers take `self` (chapter 11's consuming-accessor shape), so you read status and headers *before* you read the body.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 2. POST and Bodies
+
+A request builder accumulates: `client.post(url).header(..).body(..).send()`. `.body(bytes)` sends what you give with no implied type; `.json(&value)` serializes **and** sets `Content-Type: application/json` in one call — the boundary discipline in one builder method. The local `/echo` route answers `POST`s by replaying the body, so round-trips are assertable.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 2.1 POST: raw body vs .json — the builder pattern, consumed by send().
+let resp = client
+    .post(format!("{}/echo", base))
+    .header("x-spire-note", "raw body")
+    .body(br#"{"sym":"RAW","px":1.0}"#.to_vec())
+    .send()
+    .unwrap();
+assert_eq!(resp.status().as_u16(), 200);
+assert_eq!(resp.text().unwrap(), r#"{"sym":"RAW","px":1.0}"#);
+
+// .json(&value) = serialize + set the content type, in one call
+use serde_json::json;
+let payload = json!({"sym": "JSON", "px": 2.5});
+let resp = client.post(format!("{}/echo", base)).json(&payload).send().unwrap();
+assert_eq!(resp.json::<serde_json::Value>().unwrap(), payload);
+println!("POST echo: raw body and .json(&value) both round-tripped");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+The builder is the request: each method returns the builder with the setting applied, `send()` consumes it and performs the I/O. Note what `.json()` did on the *wire* — set `Content-Type: application/json` — and what it did to your *types*: `payload` was borrowed, serialized, and dropped; nothing about `serde_json::Value` leaked into the request site. §3 replaces the `Value` with named structs, which is where serde stops being a JSON decoder and starts being your API contract.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 3. JSON with serde: The Boundary Types
+
+`serde` is a *description* of your data: `#[derive(Serialize, Deserialize)]` generates the code that maps your struct to any wire format serde has a backend for — JSON today, but the struct stays the contract. The boundary rule: **wire types are plain structs, derived, and owned** (`String`/`f64`, not `&str`/lifetimes) — they exist to cross, and the API shape (`json::<T>()` returning `Result<T>`) is the edge where trust ends. `#[serde(default)]` fills absent fields; a missing *required* field is an `Err` from the decoder; `serde_json::Value` is the escape hatch when the shape is genuinely dynamic. The decode failure you will actually hit in production is **fields the API renamed** — and serde's error names the field.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 3.1 Boundary structs: derive, decode from the wire, compare as values.
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+struct Fill {
+    sym: String,
+    px: f64,
+    qty: u32,
+}
+
+let fills: Vec<Fill> = client.get(format!("{}/fills", base)).send().unwrap().json().unwrap();
+assert_eq!(fills.len(), 2);
+assert_eq!(fills[0], Fill { sym: "AAA".into(), px: 10.0, qty: 100 });
+println!("decoded {} fills from /fills: {:?}", fills.len(), fills[0]);
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 3.2 Decode is fallible at the edge: junk JSON, missing fields, defaults.
+// client.get(..).send().unwrap().json::<Fill>() on /junk would panic the unwrap:
+//   called `Result::unwrap()` on an `Err` value: Error("expected value", line: 1, column: 1)
+let junk: Result<serde_json::Value, _> = client.get(format!("{}/junk", base)).send().unwrap().json();
+assert!(junk.is_err());
+
+// a missing REQUIRED field is a decode error naming the field
+let missing: Result<Fill, _> = serde_json::from_str(r#"{"px":1.0,"qty":1}"#);
+assert!(missing.is_err()); // error text: missing field `sym` at line 1 column 15
+
+// #[serde(default)] makes a field optional with a value
+#[derive(Debug, Deserialize)]
+struct Position {
+    sym: String,
+    qty: u32,
+    #[serde(default)]
+    note: String,
+}
+let pos: Position = serde_json::from_str(r#"{"sym":"AAA","qty":7}"#).unwrap();
+assert_eq!(pos.note, "");
+assert_eq!((pos.sym.as_str(), pos.qty), ("AAA", 7));
+println!("junk -> Err; missing `sym` -> Err; defaults gave note = {:?}", pos.note);
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+Three reads on those cells. **The structs are the API documentation the compiler can check** — when the desk's wire format renames `px` to `price`, the *type* fails to decode and the error names the field, instead of a `KeyError` three screens away in a dashboard; `#[serde(rename = "price")]` is the one-line migration. **`PartialEq` on the derived struct makes round-trip tests one `assert_eq!`** — `Fill` is a value, so a POST-echo round-trip (§2) and a decode-from-wire (§3.1) compare against the original like any other value. **`Value` vs named struct is a deliberate choice, not a maturity ladder**: `Value` for genuinely dynamic payloads (config blobs, log fields), named structs for the endpoints you *own a contract with* — and the chapter's rule is contracts get types.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 4. Query Parameters, Headers, Redirects
+
+`.query(&[("k","v"), ..])` percent-encodes and appends; `.header("name", value)` sets a request header. **Redirects are followed silently by default** (up to a limit) — the response you inspect is the *destination's*; `resp.url()` shows where you landed. `Policy::none()` returns the 302 itself with its `Location` header; `Policy::limited(n)` bounds the chase. The local server reflects query strings and the `x-spire-token` header back in its body, so the cells prove what arrived *server-side*.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 4.1 query() and header(): the server sees what you sent.
+let resp = client.get(format!("{}/q", base))
+    .query(&[("sym", "SPIRE"), ("px", "101.5")])
+    .send()
+    .unwrap();
+let seen = resp.text().unwrap();
+assert!(seen.contains("sym=SPIRE") && seen.contains("px=101.5"), "{}", seen);
+
+let resp = client.get(format!("{}/tok", base))
+    .header("x-spire-token", "abc123")
+    .send()
+    .unwrap();
+assert_eq!(resp.text().unwrap(), "token=abc123");
+println!("server received: {}", seen);
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 4.2 Redirects: default follows; Policy::none shows the 302; limited bounds the chase.
+let followed = client.get(format!("{}/redir", base)).send().unwrap();
+assert_eq!(followed.status().as_u16(), 200); // landed on /ok
+assert!(followed.url().as_str().ends_with("/ok"));
+let landed = followed.url().path().to_string();
+
+let blunt = reqwest::blocking::Client::builder()
+    .redirect(reqwest::redirect::Policy::none())
+    .build()
+    .unwrap();
+let resp = blunt.get(format!("{}/redir", base)).send().unwrap();
+assert_eq!(resp.status().as_u16(), 302);
+assert_eq!(resp.headers().get("location").unwrap(), "/ok");
+println!("default followed to {}; Policy::none returned the 302", landed);
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+Three reads on those cells. **The reflection routes are the chapter's honesty device** — you are not trusting the builder's fluent chain, you are reading what the *server* received (`path=/q?sym=SPIRE&px=101.5`, `token=abc123`); in production the equivalent proof is an access log. **The default redirect policy is a correctness decision, not convenience** — following silently turns a 302 into a 200 and can turn a POST into a GET; when the desk's auth flow cares, `Policy::none()` or `Policy::limited(n)` makes the policy *named* in the builder. **`url()` is the ground truth of "where am I"** after any redirect chain — assert against it, not against the URL you *sent*.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 5. Timeouts and the Impatient Client
+
+No timeout is the default, and the default is a hung thread at 3am. `Client::builder().timeout(d)` bounds the **entire request-response exchange**; when it fires, `send()` is `Err`. The local `/slow` route sleeps 1.5s: the default client waits, the impatient one (500ms) refuses. Chapter 16's `tokio::time::timeout` is the async world's per-call version (§7); the client-level timeout is the *policy* version — set it once, every call inherits it.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 5.1 The default waits; the builder's timeout refuses. Both are visible.
+let patient = reqwest::blocking::Client::new();
+let resp = patient.get(format!("{}/slow", base)).send().unwrap();
+assert_eq!(resp.text().unwrap(), "finally");
+
+let impatient = reqwest::blocking::Client::builder()
+    .timeout(std::time::Duration::from_millis(500))
+    .build()
+    .unwrap();
+let result = impatient.get(format!("{}/slow", base)).send();
+assert!(result.is_err());
+println!("patient client waited for /slow; impatient(500ms) got Err as designed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+The receipt is the pair: the **same route**, the same 1.5s server sleep, two clients with different policies, and an `Ok` on one side / `Err` on the other. That is what a timeout *is* — not a speedup but a **decision about who you are willing to wait for**, recorded in the builder where the next reader can see it. The error you get is a reqwest timeout error (transport-level `Err`), which is why §1's rule composes: transport errors and status rejections arrive through different channels, and mature clients handle both *separately*.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 6. Streaming a Response Body
+
+`.text()`/`.json()` buffer the whole body. `bytes_stream()` — a **feature-gated** method (`stream` feature) — hands you the body as it arrives, chunk by chunk, as a `Stream<Item = Result<Bytes>>`: poll it with `while let Some(chunk) = stream.next().await`. The async-only signature is deliberate: a blocking caller has no use for "not yet" — streaming is *composition with waiting*, the async world's home turf. The chapter's use is a big synthetic body: count bytes and chunks, assert the totals, print the shape.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 6.1 bytes_stream: the body as a Stream of Bytes chunks (async runtime required).
+// The /big route serves 64 KiB; stream it rather than buffer it.
+// StreamExt: the chunk loop below; SinkExt: §8's ws.send — both persist
+use futures_util::{SinkExt, StreamExt};
+
+let rt = tokio::runtime::Runtime::new().unwrap();
+let (total, chunks) = rt.block_on(async {
+    let c = reqwest::Client::new(); // the ASYNC client: blocking builders cannot await
+    let resp = c.get(format!("{}/big", base)).send().await.unwrap();
+    let mut stream = resp.bytes_stream();
+    let mut total = 0usize;
+    let mut chunks = 0usize;
+    while let Some(item) = stream.next().await {
+        total += item.unwrap().len();
+        chunks += 1;
+    }
+    (total, chunks)
+});
+assert_eq!(total, 65536);
+assert!(chunks >= 1);
+println!("streamed {} bytes in {} chunks from /big", total, chunks);
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+The cell returns a *pair* from `block_on` — the async block is an expression, and `total`/`chunks` are its value. **What streaming buys** is not speed for one body but *bounded memory under backpressure*: a 2 GiB download buffered is 2 GiB of RAM; streamed and forwarded chunk-by-chunk it is one chunk. **Why async-only**: the `Stream` protocol is poll-based, and a blocked thread cannot poll — §16's "futures are frames" is the mechanism, and `while let Some(item) = stream.next().await` is the idiom you will reuse for §8's WebSocket messages unchanged.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 7. The Async Client
+
+`reqwest::Client` — same builder, same methods, but `send()`/`json()`/`text()` are **async fns**: each `.await` is a suspension point (§16.7), and a slow server costs zero threads. The client is still `Clone` (pooled), and the concurrency story from §16.8 applies unchanged: `tokio::join!` fires requests concurrently on one task; `tokio::spawn` gives each request its own task; `tokio::time::timeout` wraps any single call. The async half of the chapter is where the desk's real feed client will live.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 7.1 The async client: same vocabulary, awaited. Concurrent fan-out with join!.
+
+let rt = tokio::runtime::Runtime::new().unwrap();
+let (fill_count, pos_count) = rt.block_on(async {
+    let c = reqwest::Client::new();
+    // two requests, one task, overlapped waiting — §16's join! exactly
+    let (f, p) = tokio::join!(
+        c.get(format!("{}/fills", base)).send(),
+        c.get(format!("{}/ok", base)).send(),
+    );
+    let fills: Vec<Fill> = f.unwrap().json().await.unwrap();
+    let body = p.unwrap().text().await.unwrap();
+    (fills.len(), body.len())
+});
+assert_eq!(fill_count, 2);
+assert!(pos_count > 0);
+println!("join! fetched {} fills and {} body bytes concurrently", fill_count, pos_count);
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 7.2 Per-call deadlines: tokio::time::timeout wraps any single request.
+let rt = tokio::runtime::Runtime::new().unwrap();
+rt.block_on(async {
+    let c = reqwest::Client::builder().build().unwrap();
+    // fast route inside a generous deadline: Ok
+    let ok = tokio::time::timeout(std::time::Duration::from_millis(800),
+        c.get(format!("{}/ok", base)).send()).await;
+    assert!(ok.is_ok());
+    // slow route inside a tight deadline: Err(Elapsed) — the future is dropped
+    let late = tokio::time::timeout(std::time::Duration::from_millis(200),
+        c.get(format!("{}/slow", base)).send()).await;
+    assert!(late.is_err());
+    println!("per-call timeout: /ok answered inside 800ms; /slow cut at 200ms");
+});
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+Three reads on those cells. **The async client is not a different library** — the builder, the status contract, `error_for_status`, the header map are all identical; what changes is *every I/O call gained `.await`*, which is the chapter-16 promise kept: add a character to each call site, and a slow server stops costing a thread. **`join!` on two requests is the honest concurrency for a snapshot fetch** — both in flight at once on one task, both results kept, no scheduling overhead; when the fan-out is dynamic (N symbols), `spawn` per request and await the handles, §8.1's shape. **The two timeout layers compose deliberately**: builder-level for policy ("no request of mine outlives 5s"), `tokio::time::timeout` for per-call SLAs ("this endpoint answers in 200ms or I route around it") — §11's feed loop uses both.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 8.1 The local WebSocket endpoint: tokio listener + accept_async echo server.
+// Given: subprotocol negotiation and TLS are out of scope; this is the vanilla echo.
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static WS_PORT: AtomicUsize = AtomicUsize::new(0);
+
+fn start_ws_server() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let port = rt.block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = match listener.accept().await {
+                    Ok(x) => x,
+                    Err(_) => break,
+                };
+                tokio::spawn(async move {
+                    let mut ws = match tokio_tungstenite::accept_async(stream).await {
+                        Ok(w) => w,
+                        Err(_) => return,
+                    };
+                    while let Some(msg) = ws.next().await {
+                        match msg {
+                            Ok(m) => {
+                                if m.is_close() {
+                                    // the close handshake needs BOTH sides: reply, then drain
+                                    use tokio_tungstenite::tungstenite::Message;
+                                    ws.send(Message::Close(None)).await.ok();
+                                    let _ = ws.next().await;
+                                    break;
+                                }
+                                if m.is_text() || m.is_binary() {
+                                    if ws.send(m).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                // Ping/Pong frames are handled by tungstenite automatically
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
+        });
+        port
+    });
+    WS_PORT.store(port as usize, Ordering::SeqCst);
+    let _ = rt; // the runtime is dropped here; the spawned accept loop is detached
+}
+
+start_ws_server();
+println!("local WS endpoint listened on {} (and dies with this cell's runtime)", WS_PORT.load(Ordering::SeqCst));
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+Wait — the runtime just dropped at the end of that cell. The accept loop lives on a **detached task spawned into that runtime**, and tokio's runtime shuts down when dropped, killing spawned tasks. The cell is honest about the danger and the §8.2 cell fixes it: **the runtime that owns the accept loop must be stored, not dropped** — `OnceLock<Runtime>` (chapter 14) parks it for the notebook's lifetime. This is §16's "the runtime owns the workers" with teeth.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 8.2 The runtime must outlive its tasks: park it in a OnceLock (chapter 14 returns).
+static WS_RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+
+fn start_ws_server_parked() -> u16 {
+    let rt = WS_RT.get_or_init(|| tokio::runtime::Runtime::new().unwrap());
+    rt.block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = match listener.accept().await {
+                    Ok(x) => x,
+                    Err(_) => break,
+                };
+                tokio::spawn(async move {
+                    let mut ws = match tokio_tungstenite::accept_async(stream).await {
+                        Ok(w) => w,
+                        Err(_) => return,
+                    };
+                    while let Some(msg) = ws.next().await {
+                        match msg {
+                            Ok(m) => {
+                                if m.is_close() {
+                                    use tokio_tungstenite::tungstenite::Message;
+                                    ws.send(Message::Close(None)).await.ok();
+                                    let _ = ws.next().await;
+                                    break;
+                                }
+                                if m.is_text() || m.is_binary() {
+                                    if ws.send(m).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
+        });
+        port
+    })
+}
+
+let ws_port = start_ws_server_parked();
+println!("local WS endpoint parked on port {} (runtime held by OnceLock)", ws_port);
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 8. WebSockets: The Handshake
+
+A WebSocket starts as an HTTP request — `GET` with `Upgrade: websocket` — answered `101 Switching Protocols`; after that the bytes are frames, not HTTP. **`connect_async(url)`** performs the whole dance and returns `(WebSocketStream, Response)`: the stream is your session, the response carries the `101` and headers (assert on the status — it is the protocol switch made visible). The server side is the mirror: `accept_async(stream)` on a tokio `TcpStream`. Two gotchas probed the hard way: tungstenite **rejects a client that sends `Sec-WebSocket-Protocol` unless the server echoes it back** (`SecWebSocketSubProtocolError`) — subprotocol negotiation is a two-sided contract; and the `async-tungstenite` runtime-in-runtime hazard above is why 8.1 exists before 8.2.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 8.3 connect_async: the 101 is the handshake's receipt.
+let rt = tokio::runtime::Runtime::new().unwrap();
+rt.block_on(async {
+    let url = format!("ws://127.0.0.1:{}/feed", ws_port);
+    let (ws, resp) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    assert_eq!(resp.status(), 101); // Switching Protocols
+    assert!(resp.headers().get("upgrade").is_some());
+    println!("connected: {} -> status {} (upgrade header present)", url, resp.status());
+    drop(ws); // the session lives one cell; §9 reconnects — sessions are per-runtime
+});
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 9. WebSockets: Streams, Sinks, Messages
+
+`WebSocketStream` is a **`Stream` + `Sink` of `Message`s**: `while let Some(msg) = ws.next().await` receives, `ws.send(msg).await` transmits — the `StreamExt`/`SinkExt` traits from `futures-util` in action, the same `while let ... next().await` shape as §6's byte chunks. **`Message` is an enum**: `Text`, `Binary`, `Ping`, `Pong`, `Close` — pattern-match it; `is_text()`/`to_text()` and `is_binary()`/`into_data()` are the accessors. The echo server answers Text and Binary verbatim, which makes the protocol testable: send a string, receive the same string.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 9.1 Text and binary round-trips against the local echo endpoint.
+use tokio_tungstenite::tungstenite::Message;
+
+let rt = tokio::runtime::Runtime::new().unwrap();
+rt.block_on(async {
+    let url = format!("ws://127.0.0.1:{}/feed", ws_port);
+    let (mut ws, resp) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    assert_eq!(resp.status(), 101);
+
+    // text frame out, same text back
+    ws.send(Message::text(r#"{"sym":"SPIRE","px":101.5}"#)).await.unwrap();
+    let echoed = ws.next().await.unwrap().unwrap();
+    assert!(echoed.is_text());
+    assert_eq!(echoed.to_text().unwrap(), r#"{"sym":"SPIRE","px":101.5}"#);
+
+    // binary frame: the feed's compact form
+    ws.send(Message::binary(vec![1u8, 2, 3])).await.unwrap();
+    let bin = ws.next().await.unwrap().unwrap();
+    assert!(bin.is_binary());
+    assert_eq!(bin.into_data(), vec![1, 2, 3]);
+
+    println!("echo endpoint round-tripped one text and one binary frame");
+});
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 9.2 The close handshake: both sides, or the socket resets.
+let rt = tokio::runtime::Runtime::new().unwrap();
+rt.block_on(async {
+    let url = format!("ws://127.0.0.1:{}/feed", ws_port);
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    ws.close(None).await.unwrap(); // send Close
+    // the server replies Close and drains; our next() sees it
+    let closed = ws.next().await.unwrap().unwrap();
+    assert!(closed.is_close());
+    println!("close handshake completed: Close frame received back");
+    // (skip the reply, or drop without draining, and the peer sees a TCP reset —
+    //  tungstenite surfaces it as ResetWithoutClosingHandshake)
+});
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+Three reads on those cells. **The echo loop is the entire protocol test rig**: text goes out and comes back identical, binary likewise — and every *real* feed client is this loop plus a decoder where the assert sits. **`Message` as an enum is why WS handlers stay honest** — a `match` over the variants forces the Ping/Close cases to be *named* decisions rather than forgotten paths; the probe that taught §8.2's server to reply to Close was a real `ResetWithoutClosingHandshake` from ignoring it. **The close handshake is bidirectional by protocol design**: `close(None)` sends the Close frame, the peer replies, *then* the socket may die; the drain on the server side (`let _ = ws.next().await`) is the difference between a clean switch-off and a reset error in the client's log.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 10. Blocking vs Async: Choosing at the Boundary
+
+Same library, two clients, one decision — and it is §16.10 applied to a dependency. **The blocking client** for CLI tools, one-shot scripts, tests, and `main`s with nothing else to do; **the async client** whenever the code shares a runtime with other work (§11's feed loop) or composes with the ecosystem (§18's Redis, §19's PostgreSQL are async-first). The trap the chapter has already shown twice: **both clients in one process is fine; both in one call chain is not** — a blocking call inside async code stalls a worker (§16.10's first rule), and `reqwest::blocking` *panics if driven from inside an async context* rather than quietly misbehaving.
+
+| Choose | When | Cost |
+|---|---|---|
+| `reqwest::blocking::Client` | scripts, CLI, tests, sync `main` | a thread per in-flight request; cannot join a runtime |
+| `reqwest::Client` | servers, feeds, anything on tokio | every call site carries `.await`; runtime required |
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 10.1 Both clients, their homes: blocking in sync context, async on a runtime.
+// (Do NOT call the blocking client from inside block_on — reqwest panics by design.)
+
+let sync_status = reqwest::blocking::Client::new()
+    .get(format!("{}/ok", base))
+    .send()
+    .unwrap()
+    .status();
+assert_eq!(sync_status.as_u16(), 200);
+
+let rt = tokio::runtime::Runtime::new().unwrap();
+let async_status = rt.block_on(async {
+    reqwest::Client::new()
+        .get(format!("{}/ok", base))
+        .send()
+        .await
+        .unwrap()
+        .status()
+});
+assert_eq!(async_status.as_u16(), 200);
+println!("blocking in sync context: {}; async on the runtime: {}", sync_status, async_status);
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+The rule that keeps this safe on a real desk: **the boundary is a function**. A sync `fn` may use the blocking client freely; an `async fn` may use the async client freely; the seam between them is an explicit `block_on` (sync→async, one per program) or `spawn_blocking` (async→sync, §16's valve) — never an accidental blocking call *inside* the async side. §11's feed is async end to end precisely so the seam count stays at one.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 11. The Live Feed: Reconnect as a Loop
+
+The real feed *will* drop — deploys, network blips, server restarts — so the unit of a production WS client is not "connect" but **connect-with-reconnect**: a loop that connects, consumes messages until the stream ends or errors, tears down cleanly, waits (backoff), and tries again. The skeleton below runs two sessions against the local echo endpoint — a simulated drop between them — and counts both the messages and the reconnect. This loop is the chapter's deliverable: everything from §1 to §10 assembles into it.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 11.1 Connect-consume-teardown-reconnect: the loop every feed client is made of.
+let rt = tokio::runtime::Runtime::new().unwrap();
+let (messages, sessions) = rt.block_on(async {
+    let url = format!("ws://127.0.0.1:{}/feed", ws_port);
+    let mut total = 0u32;
+    let mut sessions = 0u32;
+    let mut backoff_ms = 50u64;
+
+    while sessions < 2 {
+        match tokio_tungstenite::connect_async(&url).await {
+            Ok((mut ws, resp)) if resp.status() == 101 => {
+                sessions += 1;
+                backoff_ms = 50; // success resets the backoff
+                // consume until the stream ends (drop/err) — here: send 3, read 3, drop
+                for i in 0..3 {
+                    ws.send(Message::text(format!(r#"{{"seq":{}}}"#, i))).await.unwrap();
+                    if let Some(Ok(m)) = ws.next().await {
+                        if m.is_text() {
+                            total += 1;
+                        }
+                    }
+                }
+                ws.close(None).await.ok(); // clean teardown before the next attempt
+                let _ = ws.next().await;
+            }
+            Ok(_) => unreachable!("local server always upgrades"),
+            Err(_) => {
+                // transport refused: back off and retry (real feeds land here)
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                backoff_ms = (backoff_ms * 2).min(5_000);
+            }
+        }
+    }
+    (total, sessions)
+});
+assert_eq!(sessions, 2);
+assert_eq!(messages, 6); // 3 frames per session
+println!("feed loop: {} messages across {} sessions, backoff reset on success", messages, sessions);
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+Three reads on the loop. **The state that survives a drop lives *outside* the connection** — `total`, `sessions`, `backoff_ms` are declared before the `match`; a reconnect must never reset your book (the position you tracked is not in the socket); on a real feed, the first message of a new session is a *snapshot* request, not a resume prayer. **Backoff is a variable with a reset condition** — doubling to a cap on failure, reset on success; the version here is honest about being triggered by `connect` errors, and a production loop adds a heartbeat timeout (a session with no messages for N seconds is *also* a drop, just a quieter one). **`match` on the connect `Result` plus the status guard keeps every path named**: upgrade, non-101 (`unreachable!` against our own server, but a real endpoint can answer 401/503 — that is where auth and capacity errors live), and transport `Err` — the three futures of any connection.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 12. Reading the Compiler: E-Codes
+
+| Diagnostic | The story it tells |
+|---|---|
+| **E0277** | `Result` is not a future — `.await` on a non-async call (the `accept().await` on a *std* listener from ch17's own probe); or `WebSocketStream<TcpStream>` refusing `send` because tokio/tungstenite feature mismatch — the wrong crate pair, not wrong code. |
+| **E0599** | No method `send` with satisfactory bounds — `SinkExt` not in scope for the WS stream (import `futures_util::SinkExt`); `bytes_stream` absent — the `stream` feature is off. |
+| **E0432/E0433** | The crate cell has not run, or the feature is missing: `json` for `json::<T>()`, `stream` for `bytes_stream`, `blocking` for the blocking client. |
+| **E0308** | `.await` missing at the end of an async call chain — the whole expression becomes the future instead of its output. |
+| **E0382** | The response was consumed by `.text()` and then asked for headers — body readers take `self` (read status/headers first). |
+| **serde `Error`** | Not a rustc code: decode failures name the field and position (`missing field sym at line 1 column 15`) — the wire moved, your struct is the contract that caught it. |
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 12.1 The E0308 of a missing await, demonstrated at the type level in a comment.
+// let r = reqwest::Client::new().get(format!("{}/ok", base)).send(); // not awaited
+// r.unwrap().status()  // error[E0308]? No: r is a Future; unwrap does not exist on it —
+//                      // the actual diagnostic is E0599: `Future` is not a Result-style type
+let r = reqwest::blocking::Client::new().get(format!("{}/ok", base)).send().unwrap();
+assert_eq!(r.status().as_u16(), 200);
+println!("missing .await leaves you holding a Future; the blocking client is the sync twin");
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 12.2 The consuming-reader order: status and headers BEFORE the body readers.
+let resp = client.get(format!("{}/ok", base)).send().unwrap();
+let status = resp.status();          // borrow while we can
+let ctype = resp.headers().get("content-type").map(|v| v.to_str().unwrap().to_string());
+let body = resp.text().unwrap();     // consumes resp
+assert_eq!(status.as_u16(), 200);
+assert_eq!(ctype.as_deref(), Some("text/plain")); // the §0.2 route table is the truth
+assert!(body.len() > 0);
+// resp.status();  // E0382: borrow of moved value: `resp` — text() took it all
+println!("status ({}) and content-type read first, body consumed last", status);
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+Two reads on those cells. **12.1 is the honest version of a demo failure**: the missing-`.await` diagnostic in this exact shape is E0599 ("`send` returns a Future, not a Result"), and the *fix* the compiler suggests is `.await` — the chapter teaches the diagnostic by showing the working call beside it. **12.2 is chapter 11's consuming-accessor rule surviving into HTTP**: the response is a value with a borrow phase (status, headers) and a consume phase (body); the E0382 in the comment is what "the body readers take `self`" means mechanically.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 13. Mental Model: The Receipts
+
+| Claim | Receipt |
+|---|---|
+| The client is a configured value | §1.1: one `Client`, three cells of calls; §4.2: builder policy named once |
+| Status is data; rejection is opt-in | §1.2: 404/500 arrived `Ok`; `error_for_status` refused the 500 |
+| serde structs are the API contract | §3.1: decoded `Vec<Fill>` == values; §3.2: junk → Err, missing field → Err naming it |
+| The server sees what you sent | §4.1: reflected `path=/q?sym=SPIRE&px=101.5`, `token=abc123` |
+| Redirect policy is named, not silent | §4.2: default landed 200; `Policy::none` returned the 302 + Location |
+| A timeout is a who-will-I-wait-for decision | §5.1: same /slow, `Ok` for the patient, `Err` at 500ms for the impatient |
+| Streams bound memory, not latency | §6.1: 65536 bytes arrived as counted chunks, never fully buffered |
+| Async = same client, awaited | §7.1: `join!` fanned two requests on one task; §7.2: per-call deadline cut /slow at 200ms |
+| WS starts as HTTP, then frames | §8.3: 101 + Upgrade header; §9.1: text/binary round-trips |
+| Close is a handshake | §9.2: Close → Close → clean end; §11: teardown before reconnect |
+| The runtime owns its tasks | §8.1→§8.2: dropped runtime killed the accept loop; `OnceLock` parked it |
+| Reconnect is a loop, state outside | §11.1: 6 messages, 2 sessions, backoff reset on success |
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 14. Cheat Sheet
+
+```rust
+// ---- blocking (scripts, tests, sync main) ----
+let c = reqwest::blocking::Client::builder()
+    .timeout(std::time::Duration::from_secs(5))
+    .redirect(reqwest::redirect::Policy::limited(3))
+    .build().unwrap();
+let r = c.get(url).query(&[("sym","A")]).header("x-tok","t").send().unwrap();
+let r = c.post(url).json(&fill).send().unwrap();
+r.status(); r.error_for_status()?; r.headers().get("x").unwrap().to_str();
+r.text().unwrap(); r.json::<Fill>().unwrap();          // consume LAST
+
+// ---- async (everything that shares a runtime) ----
+let c = reqwest::Client::new();
+let r = c.get(url).send().await.unwrap();
+let fills: Vec<Fill> = r.json().await.unwrap();
+tokio::join!(c.get(a).send(), c.get(b).send());        // concurrent on one task
+tokio::time::timeout(dur, c.get(url).send()).await;    // per-call deadline
+let mut s = c.get(big).send().await.unwrap().bytes_stream(); // stream feature
+while let Some(chunk) = s.next().await { ... }         // futures_util::StreamExt
+
+// ---- serde: the boundary types ----
+#[derive(Serialize, Deserialize, PartialEq)]
+struct Fill { sym: String, px: f64, qty: u32,
+    #[serde(default)] note: String }                   // absent -> Default
+// missing required field / bad JSON = Err naming the field, at the edge
+
+// ---- websocket (tokio-tungstenite + futures_util::{SinkExt, StreamExt}) ----
+let (mut ws, resp) = tokio_tungstenite::connect_async("ws://..").await.unwrap();
+resp.status() == 101;                                   // the handshake receipt
+ws.send(Message::text("..")).await.unwrap();            // Sink
+while let Some(m) = ws.next().await { match m? {        // Stream
+    Message::Text(t) => .., Message::Binary(b) => ..,
+    Message::Close(_) => break, _ => {} } }
+ws.close(None).await.ok();                              // both sides, then drain
+```
+
+Seven load-bearing sentences: **configure the client once; statuses are data until `error_for_status`; boundary types are derived plain structs; timeouts are policy set in the builder; streams and WS messages share the same `while let Some(x) = .. .next().await` spine; the close handshake has two sides; reconnect state lives outside the socket.**
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 15. Review
+
+Twelve questions, in chapter order. Answers are in the prose above each.
+
+1. **(§1)** What does `send()` returning `Ok` actually guarantee, and which method converts a bad status into an `Err`?
+2. **(§1)** Why does a header *lookup* ignore case while the *value* needs `.to_str()`?
+3. **(§2)** What does `.json(&value)` do to the request, and what does it not do to your struct?
+4. **(§3)** Why are boundary structs plain, derived, and owned — and what fires when the API renames a field?
+5. **(§4)** What does the default redirect policy do to a 302, and which two builder settings change that?
+6. **(§5)** Where is a client-level timeout set, what does it bound, and how does it differ from §7.2's per-call `tokio::time::timeout`?
+7. **(§6)** What does streaming buy for a large body, and why is `bytes_stream` async-only?
+8. **(§7)** What changes about the client between §1 and §7, and what stays identical?
+9. **(§8)** What does `resp.status() == 101` certify, and what does tungstenite do to a client that sends `Sec-WebSocket-Protocol` the server does not echo?
+10. **(§9)** Name the `Message` variants a feed loop must decide about, and what forgetting `Close` costs the peer.
+11. **(§10)** Where may each client run, and why does `reqwest::blocking` panic inside an async context rather than misbehave quietly?
+12. **(§11)** Which state survives a reconnect, where does it live, and what resets the backoff?
+
+### What Comes Next
+
+| Next | What it borrows from here |
+|---|---|
+| **18 — Redis** | the async client discipline (§7) applied to a cache: commands as round-trips, pipelines as batching, pub/sub as the WS loop's server-side twin. |
+| **19 — PostgreSQL** | `sqlx` pools are §7's client-per-task made concrete; `fetch_all` is §6's stream consumed; transactions must survive `await` points — §16.10's rules verbatim. |
+| **20 — PyO3** | the escape hatch back to Python: `requests` returns objects, serde returns *typed* values — the boundary-struct idea is the export. |
+| **21 — Capstone Prep** | §11's loop plus §18's cache plus §19's storage is the market-data service the capstone assembles. |
+
+Carry forward: **the boundary is a function; every network call is a `Result` with a timeout; the feed is a loop, not a connection.**
+</VSCode.Cell>

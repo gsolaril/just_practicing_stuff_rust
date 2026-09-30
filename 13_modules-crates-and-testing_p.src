@@ -1,0 +1,894 @@
+<VSCode.Cell language="markdown">
+# Rust 113: Modules, Crates and Testing — Practice
+
+Companion exercises for `13_modules-crates-and-testing_e.ipynb`. Every section mirrors the section of the same number in the example notebook, and there is one exercise for each of its ten demonstration cells, so a `**See**` reference lands on the exact code that shows the technique.
+
+The checks at the bottom of each cell are the grader. Edit only the parts marked `TODO`; when a cell runs without panicking you will see an `Exercise N.M passed` line.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+### Contents
+
+- [0. How to Complete These Exercises](#0-how-to-complete-these-exercises)
+- [1. The Module Tree: `mod` Draws the Fence](#1-the-module-tree-mod-draws-the-fence)
+- [2. Visibility: `pub`, `pub(crate)`, `pub(super)`](#2-visibility-pub-pubcrate-pubsuper)
+- [3. Paths: `crate::`, `super::`, `self::`](#3-paths-crate-super-self)
+- [4. `use`: The Name Rewriter](#4-use-the-name-rewriter)
+- [6. `#[test]`: Tests as Ordinary Functions](#6-test-tests-as-ordinary-functions)
+- [7. `cargo test`: What the Harness Adds](#7-cargo-test-what-the-harness-adds)
+- [8. Reading the Compiler: E-Codes](#8-reading-the-compiler-e-codes)
+- [11. Review: Mixed Problems](#11-review-mixed-problems)
+
+§1–§8 each have one exercise for every demonstration cell of the example notebook (the Contents lists only the exercise-bearing sections; §5 introduces crates, files and `cargo` with no demonstration cell, §9's control panel and §10's cheat sheet are reading). When a check fails, the fastest route back is §10 of the example notebook, which is the cheat sheet.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 0. How to Complete These Exercises
+
+This notebook runs on the same **evcxr** kernel as the example notebook. Three consequences shape how you work:
+
+1. **No `fn main`.** The body of a cell *is* the body of `main`. Type statements directly.
+2. **State persists.** A binding from one cell is visible in every cell below it — including `use` lines.
+3. **Items are order-independent.** A `mod` or `fn` may be used above the cell that defines it.
+
+> **Item names must be unique across the whole notebook.** Every cell shares one namespace; two functions — or two modules — with the same name are a redefinition error even in different sections (E0428, §8 of the example notebook). The exercise names here are unique by construction — do not introduce colliding helpers.
+
+### The stub convention
+
+Each exercise cell declares a signature, a doc comment stating the contract, and a `// --- check (do not modify) ---` block of `assert_eq!`/`assert!` calls. The body you must fill in is `todo!()`, which compiles but **panics** when executed. Replace it and re-run; an `Exercise N.M passed` line means you are done.
+
+### Three notes specific to this chapter
+
+- **The module tree is part of the exercise.** Several stubs live *inside* modules, and their checks call them by path — solve the body, but read the tree the check climbs too. Given code is complete and stays: `vault`'s constant and `sidecar` (§3.1), the `Lever` enum (§3.1), `aviary`'s re-export and the glob (§4.1), `facade`'s three `pub use` lines (§11.2) and both `pub(super)` offerings (§2.1, §11.1) are declared for you — the one-namespace rule working *for* you.
+- **A `use` inside a body is scoped to that body.** §3.1's variant import happens inside the function: `use crate::Lever::Up;` lives and dies with the call. Top-level `use` lines are the persistent kind (§0 of the example notebook); body-local ones are not.
+- **The E-codes are live here.** The wrong shape trips the exact diagnostics the example notebook catalogues in §8: a bare first segment that tries to climb is E0433 (§1.1's hint), naming a private item from outside is E0603 (§2.1's check), redefining a `mod` name is E0428, and a `use` of a missing path is E0432. When you see one, you are one step from the lesson.
+
+### Expect warnings until you finish
+
+Three warning families are normal and self-cleaning:
+
+- `unused variable` — every unsolved stub whose parameters are untouched;
+- `unused import` — the given `use`/`pub use` lines that serve a stub you have not solved yet;
+- `never used`/`never read`/`never constructed` — stub-induced dead code: whole given functions and enum variants sit unused until your body calls them.
+
+Each warning disappears when you implement the body that needs it. If a diagnostic appears that is not in one of those families, it is yours.
+
+**See**: §0 of the example notebook — and its §8 when a diagnostic surprises you.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+### Exercise 0.1 — The smoke test
+
+**Goal**: prove the kernel compiles your items and runs your code, before any real exercise.
+
+**Objectives**
+
+- implement `kernel_pulse` to return the chapter's number
+- keep the signature unchanged
+
+**See**: §0.1 of the example notebook.
+
+**Hint**: the body is one tail expression; no semicolon.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+/// Return the chapter number — the smallest possible proof the kernel is alive.
+///
+/// TODO: replace `todo!()` with the chapter number.
+fn kernel_pulse() -> u32 {
+    todo!()
+}
+
+// --- check (do not modify) ---
+assert_eq!(kernel_pulse(), 13);
+println!("Exercise 0.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 1. The Module Tree: `mod` Draws the Fence
+
+### Exercise 1.1 — The tree, from memory
+
+**Goal**: build the two-level tree the example notebook's §1 drew — then have a function in the root climb it.
+
+**Objectives**
+
+- the `depot` module is declared; implement its four items exactly as the doc comments ask (one `pub const`, one private `fn`, one `pub fn` calling the private one, one nested `pub mod shelf` with a `pub fn` at depth two)
+- implement `depot_dispatch` in the crate root to name all three reachable values by path — the two functions and the depth-two constant
+- keep the given module and the signatures unchanged
+
+**See**: §1.1 of the example notebook.
+
+**Hint**: inside `depot`, the private helper is called bare (`sideline()`); from the root it is `depot::rack()`, and the shelf constant is `depot::shelf::LIMIT` — the tree read aloud.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+mod depot {
+    /// A private helper: visible inside depot, invisible outside.
+    ///
+    /// TODO: return 4.
+    fn sideline() -> u32 {
+        todo!()
+    }
+
+    /// The public face of the private helper.
+    ///
+    /// TODO: return sideline()'s value.
+    pub fn rack() -> u32 {
+        todo!()
+    }
+
+    /// One more fence: a child module with its own public fn and constant.
+    pub mod shelf {
+        /// The shelf limit: a public constant at depth two.
+        pub const LIMIT: u32 = 9;
+
+        /// TODO: return 50.
+        pub fn top() -> u32 {
+            todo!()
+        }
+    }
+}
+
+/// Name the whole tree from the root: private thing via its public face,
+/// nested thing via its path.
+///
+/// TODO: return (depot::rack(), depot::shelf::top(), depot::shelf::LIMIT).
+fn depot_dispatch() -> (u32, u32, u32) {
+    todo!()
+}
+
+// --- check (do not modify) ---
+assert_eq!(depot_dispatch(), (4, 50, 9));
+println!("Exercise 1.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 2. Visibility: `pub`, `pub(crate)`, `pub(super)`
+
+### Exercise 2.1 — Downward privacy, and the ceiling
+
+**Goal**: rebuild §2.1's probe — a private fn, a child that reads it, a `pub(super)` offering the parent accepts and the root may not touch.
+
+**Objectives**
+
+- the `larder` module is declared; implement its three items exactly as the doc comments ask (the private `fn`, the root-facing wrapper, the child's downward read) — the child's `pub(super)` fn and the parent's `accept` are given, so the offering has a consumer
+- implement `larder_report` in the root to collect the three values the fence lets through — and *only* those; reaching for the fourth is the E0603 the example notebook's §2 catalogues
+- keep the given module and the signatures unchanged
+
+**See**: §2.1 of the example notebook.
+
+**Hint**: `pub(super) fn for_pantry()` inside `bin` is visible to `larder`'s own fns — `larder::report` may call it — but from the root `larder::bin::for_pantry()` is E0603. The downward read is `super::cache()` from inside the child.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+mod larder {
+    /// The parent's private store: children see it, outsiders do not.
+    ///
+    /// TODO: return 7.
+    fn cache() -> u32 {
+        todo!()
+    }
+
+    /// The root-facing wrapper around the private store.
+    ///
+    /// TODO: return cache()'s value.
+    pub fn report() -> u32 {
+        todo!()
+    }
+
+    /// The parent consuming its child's pub(super) offering — given.
+    pub fn accept() -> u32 {
+        bin::for_pantry()
+    }
+
+    /// The child module: one rung down the tree.
+    pub mod bin {
+        /// Offered to the parent only — the pub(super) ceiling. Given.
+        pub(super) fn for_pantry() -> u32 {
+            8
+        }
+
+        /// Downward privacy: the child reads the parent's private fn.
+        ///
+        /// TODO: return super::cache()'s value.
+        pub fn peek() -> u32 {
+            todo!()
+        }
+    }
+}
+
+/// Everything the fence lets the root see, in one tuple.
+///
+/// TODO: return (larder::report(), larder::bin::peek()).
+fn larder_report() -> (u32, u32) {
+    todo!()
+}
+
+// --- check (do not modify) ---
+assert_eq!(larder_report(), (7, 7));
+assert_eq!(larder::accept(), 8); // the parent consumes the pub(super) offering
+// larder::bin::for_pantry() from here would be:
+// error[E0603]: function `for_pantry` is private
+println!("Exercise 2.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+### Exercise 2.2 — `pub(crate)`: the shared-internal knob
+
+**Goal**: make two sibling modules share a helper without publishing it — the §2.2 pattern, with the sibling doing the calling.
+
+**Objectives**
+
+- the `silo`/`mill` modules are declared; implement the two items the doc comments ask for (a `pub(crate)` fn in `silo`, a private one beside it)
+- implement `blend` *inside* `mill` to reach across the fence — `crate::silo::measure()` from a sibling module — and add `mill`'s own local 2; silo's private `grain()` is the control: no route reaches it
+- keep the given modules and the signature unchanged
+
+**See**: §2.2 of the example notebook.
+
+**Hint**: from inside `mill`, the crate-root anchor names the other sibling: `crate::silo::measure()` resolves because the item is `pub(crate)`; `crate::silo::grain()` would be E0603.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+mod silo {
+    /// Shared internals: the whole crate may call it, no external crate can.
+    ///
+    /// TODO: return 30.
+    pub(crate) fn measure() -> u32 {
+        todo!()
+    }
+
+    /// silo's own private reserve: no sibling route exists.
+    ///
+    /// TODO: return 5.
+    fn grain() -> u32 {
+        todo!()
+    }
+
+    /// The only consumer of the private reserve — given, and the proof that
+    /// "private" means "module + descendants", not "nobody".
+    pub fn reserve() -> u32 {
+        grain()
+    }
+}
+
+mod mill {
+    /// The sibling call: pub(crate) crosses module fences inside the crate.
+    ///
+    /// TODO: return crate::silo::measure() + 2.
+    pub fn blend() -> u32 {
+        todo!()
+    }
+}
+
+// --- check (do not modify) ---
+assert_eq!(mill::blend(), 32); // 30 shared + 2 local; grain() was never a route
+assert_eq!(silo::reserve(), 5); // the private reserve, consumed inside its own module
+// crate::silo::grain() would be:
+// error[E0603]: function `grain` is private
+println!("Exercise 2.2 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 3. Paths: `crate::`, `super::`, `self::`
+
+### Exercise 3.1 — The anchors, exercised together
+
+**Goal**: rebuild the §3.1 tree — absolute from deep, relative to a sibling, `self::` explicit, and an enum variant imported by path inside a body.
+
+**Given**: `vault`'s constant and its `sidecar` sibling are complete, and the `Lever` enum is declared with two variants — only the four `TODO` bodies are missing.
+
+**Objectives**
+
+- implement `bench`'s two fns exactly as the doc comments ask — one via the absolute anchor, one via the relative one
+- implement `lift` to import the variant `Up` by path *inside the body* and return it — a `use` inside a function is scoped to that body
+- keep the given items and the signatures unchanged
+
+**See**: §3.1 of the example notebook.
+
+**Hint**: `crate::vault::LIMIT` from anywhere; `super::vault::sidecar::stow()` from `depot_bench`; and `use crate::Lever::Up;` before the tail expression — then the bare `Up` is the variant.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+mod vault {
+    pub const LIMIT: u32 = 9;
+    pub mod sidecar {
+        pub fn stow() -> u32 {
+            3
+        }
+    }
+}
+
+/// The anchor tree: absolute down, relative across.
+mod depot_bench {
+    /// Absolute: crate root, vault, the depth-two constant.
+    ///
+    /// TODO: return crate::vault::LIMIT.
+    pub fn from_root() -> u32 {
+        todo!()
+    }
+
+    /// Relative: the parent's sibling module, one `super::` up.
+    ///
+    /// TODO: return super::vault::sidecar::stow().
+    pub fn from_sibling() -> u32 {
+        todo!()
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum Lever {
+    Up,
+    Down,
+}
+
+/// A body-local use: the variant is in scope for this function only.
+///
+/// TODO: `use crate::Lever::Up;` then return it.
+fn lift() -> Lever {
+    todo!()
+}
+
+// --- check (do not modify) ---
+assert_eq!(depot_bench::from_root(), 9);
+assert_eq!(depot_bench::from_sibling(), 3);
+assert_eq!(lift(), Lever::Up);
+println!("Exercise 3.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 4. `use`: The Name Rewriter
+
+### Exercise 4.1 — The toolbox: rename, re-export, glob
+
+**Goal**: take §4.1's three moves for a spin against given modules — a rename that de-duplicates two `Widget`s, a re-export used like a local item, and a glob over a `gearbox` module.
+
+**Given**: the `aviary` tree and its `pub use` facade are complete, as is the `gearbox` module and the top-level `use` lines that serve this exercise — the namespace already holds `GaugeA`, `GaugeB`, `Dial`, `whirr` and `clank`.
+
+**Objectives**
+
+- implement `gauge_pair` to return *both* widgets via their bound names — `GaugeA::new` builds one, `GaugeB::new` the other
+- implement `dial_read` to return the re-export's value — `Dial` was published by `pub use`, reached as if it were declared here
+- implement `gearbox_sum` to return the two globbed functions' total
+- keep the given tree and signatures unchanged
+
+**See**: §4.1 of the example notebook.
+
+**Hint**: `GaugeA::new(1)` and `GaugeB::new(2)` — the `as` renames are what make both names usable side by side; the re-export means `Dial::read()` needs no path at all; the glob put `whirr` and `clank` in scope.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+mod aviary {
+    pub mod north {
+        pub struct Widget {
+            pub v: u32,
+        }
+        impl Widget {
+            pub fn new(v: u32) -> Self {
+                Widget { v }
+            }
+            pub fn value(&self) -> u32 {
+                self.v
+            }
+        }
+    }
+    pub mod south {
+        pub struct Widget {
+            pub v: u32,
+        }
+        impl Widget {
+            pub fn new(v: u32) -> Self {
+                Widget { v }
+            }
+            pub fn value(&self) -> u32 {
+                self.v
+            }
+        }
+    }
+    pub use self::south::Widget as Dial; // the facade: south's Widget is THE Dial
+}
+
+mod gearbox {
+    pub fn whirr() -> u32 {
+        20
+    }
+    pub fn clank() -> u32 {
+        22
+    }
+}
+
+// the rename: two Widgets, one scope, both reachable
+use aviary::north::Widget as GaugeA;
+use aviary::south::Widget as GaugeB;
+use aviary::Dial;
+// the glob: everything in gearbox, minus the ceremony
+use gearbox::*;
+
+/// Both widgets by their bound names — the rename de-duplicated them.
+///
+/// TODO: return (GaugeA::new(1).value(), GaugeB::new(2).value()).
+fn gauge_pair() -> (u32, u32) {
+    todo!()
+}
+
+/// The re-export, imported like any local item.
+///
+/// TODO: return Dial::new(3).value().
+fn dial_read() -> u32 {
+    todo!()
+}
+
+/// The glob's two functions, summed.
+///
+/// TODO: return whirr() + clank().
+fn gearbox_sum() -> u32 {
+    todo!()
+}
+
+// --- check (do not modify) ---
+assert_eq!(gauge_pair(), (1, 2));
+assert_eq!(dial_read(), 3);
+assert_eq!(gearbox_sum(), 42);
+println!("Exercise 4.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 6. `#[test]`: Tests as Ordinary Functions
+
+### Exercise 6.1 — The three shapes, exercised in body form
+
+**Goal**: implement the two functions §6.1's harness-shaped tests would call — then drive the panicking one through `catch_unwind` and pin *its* payload, the in-process `should_panic(expected = ..)`.
+
+**Given**: the `probe` module is complete except for two `TODO` bodies — a `Result`-returning parse, a division that panics with a **literal** message, and a passing check already supplied.
+
+**Objectives**
+
+- implement `total` to parse both rows and return their sum as `Ok` — the Result-returning test shape
+- implement `cut` to return `a / b`, panicking with the literal `"division by zero"` when `b` is zero — the panic `probe_panic_check` will demand by name
+- keep the given module, the doc-comment contract and the check blocks unchanged
+
+**See**: §6.1 of the example notebook.
+
+**Hint**: `a.parse::<u32>()?` inside a `Result` body is the whole fallible shape; for the payload, a literal `panic!("division by zero")` boxes a `&'static str` — downcast it as `&str`, **not** `String` (the example notebook's §6 prose, and chapter 11).
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+mod probe {
+    /// The Result-returning test shape: parse both rows, sum them.
+    ///
+    /// TODO: replace `todo!()` with the two-parses-and-sum body.
+    pub fn total(a: &str, b: &str) -> Result<u32, std::num::ParseIntError> {
+        todo!()
+    }
+
+    /// The panic-on-bad-input shape: divide, panicking on the zero divisor.
+    ///
+    /// TODO: replace `todo!()` with the guard + division body.
+    pub fn cut(a: u32, b: u32) -> u32 {
+        todo!()
+    }
+}
+
+// --- check (do not modify) ---
+assert_eq!(probe::total("10", "32"), Ok(42));
+assert_eq!(probe::cut(9, 3), 3);
+// the honest should_panic: the panic must HAPPEN, and must be THE panic
+let panicked = std::panic::catch_unwind(|| probe::cut(1, 0));
+let msg = panicked
+    .err()
+    // a literal panic! boxes a &'static str (chapter 11), not a String
+    .and_then(|payload| payload.downcast_ref::<&str>().copied())
+    .unwrap_or_default();
+assert_eq!(msg, "division by zero");
+println!("Exercise 6.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+### Exercise 6.2 — The `cfg` gate, felt from the body side
+
+**Goal**: read the switch from inside a body — and learn its harder half: the gate decides not just what *runs* but what may be **named**, in every branch of every body.
+
+**Given**: the `depot_gate` module is complete except for two `TODO` bodies; the helper is already `#[cfg(test)]`-gated.
+
+**Objectives**
+
+- implement `cfg_state` to return `cfg!(test)` — `false` in this kernel (plain rustc never sets the test config)
+- implement `ungated_ready` to return the ungated fn's value by path
+- keep the gate on the helper and the signatures unchanged; the *commented* lines below the module show why no body — not even a `match` on `cfg!(test)` — may name the gated fn: every branch must still compile, and under plain rustc the name is gone
+
+**See**: §6.2 of the example notebook.
+
+**Hint**: `cfg!` is answerable anywhere (`cfg!(test)` is `false` here, `true` in the harness's `main`), but `depot_gate::test_only_helper()` is E0425 under plain rustc no matter what guards the call — `cfg!` asks; the gate still decides what exists.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+mod depot_gate {
+    /// The gated helper: stripped from the binary when tests are off.
+    #[cfg(test)]
+    pub fn test_only_helper() -> u32 {
+        99
+    }
+
+    /// The ungated workhorse: given, and the only fn any body may name
+    /// beside the gate.
+    pub fn always_ready() -> u32 {
+        11
+    }
+}
+
+/// What the switch says right now: plain rustc folds it to false.
+///
+/// TODO: return cfg!(test).
+fn cfg_state() -> bool {
+    todo!()
+}
+
+/// The ungated side of the report — the gated side exists only for the
+/// harness, which is why no body here may name it.
+///
+/// TODO: return depot_gate::always_ready().
+fn ungated_ready() -> u32 {
+    todo!()
+}
+
+// depot_gate::test_only_helper() from here would be:
+// error[E0425]: cannot find function `test_only_helper` in module `depot_gate`
+// Even `match cfg!(test) { true => depot_gate::test_only_helper(), .. }`
+// fails: the false branch must still compile, and under plain rustc the
+// name is gone. cfg! asks; the gate still decides what may be named.
+
+// --- check (do not modify) ---
+assert!(!cfg_state());
+assert_eq!(ungated_ready(), 11);
+println!("Exercise 6.2 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 7. `cargo test`: What the Harness Adds
+
+### Exercise 7.1 — What the harness would collect
+
+**Goal**: write the functions a `cargo test` run would collect, name, and report — then read them the way the harness does: by path, with the summary line as the exit-code contract.
+
+**Given**: the `suite` module with three `TODO` bodies; each doc comment states what its `#[test]` twin would assert. (The `#[test]` attributes themselves stay off — plain rustc strips them, which is §6's lesson — so the checks below play the harness and call them by path.)
+
+**Objectives**
+
+- implement `good` to return `true` — the always-passing test
+- implement `bad` to return the pair its `#[test]` twin would feed to `assert_eq!` — `(add(2, 2), 5)`; the check pins it as `(4, 5)`, reproducing §7's `left: 4 / right: 5` report without panicking mid-cell
+- implement `panics` to panic with `"exploded"` — the `#[should_panic(expected = "exploded")]` twin
+- keep the module and signatures unchanged
+
+**See**: §7 of the example notebook.
+
+**Hint**: the harness would print `test suite::good ... ok` — the module tree *is* the test filter. `bad`'s body is one tuple of the two assert sides; `panics`' is one `panic!("exploded")`.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+mod suite {
+    fn add(a: u32, b: u32) -> u32 {
+        a + b
+    }
+
+    /// Would print: test suite::good ... ok
+    ///
+    /// TODO: return true.
+    pub fn good() -> bool {
+        todo!()
+    }
+
+    /// Would print: test suite::bad ... FAILED — left: 4, right: 5
+    ///
+    /// TODO: return (add(2, 2), 5) — the pair its #[test] twin would assert,
+    /// reported instead of panicked so the check can pin it.
+    pub fn bad() -> (u32, u32) {
+        todo!()
+    }
+
+    /// Would print: test suite::panics - should panic ... ok
+    ///
+    /// TODO: panic with "exploded".
+    pub fn panics() {
+        todo!()
+    }
+}
+
+// --- check (do not modify) ---
+// the harness catches each panic and moves on; here, one read at a time:
+assert!(suite::good());
+assert_eq!(suite::bad(), (4, 5)); // left: 4, right: 5 — the FAILED report's pair
+let panicked = std::panic::catch_unwind(suite::panics);
+assert!(panicked.is_err());
+println!("Exercise 7.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 8. Reading the Compiler: E-Codes
+
+### Exercise 8.1 — The catalogue, dodged live
+
+**Goal**: walk all five diagnostics from the example notebook's §8 table with working callsites — every dodge in one cell, each forbidden shape kept as its captured comment.
+
+**Given**: `crate1` and `crate2` modules are complete; the doc comments name the diagnostic each stub side-steps.
+
+**Objectives**
+
+- implement `crate1_pick` to return the private helper's value through its public face — the E0603 dodge
+- implement `crate2_total` to return the re-exported constant plus the sibling fn — the E0432 and E0428 dodges in one body
+- implement `stripped_call` to return the *stripped* helper's documented value without naming it — the E0425 dodge: under plain rustc the gated item does not exist, so the body returns the constant it would have produced
+- keep the given modules, the gate and the signatures unchanged
+
+**See**: §8.1 of the example notebook.
+
+**Hint**: `crate1::open()` is the only route to `crate1`'s private fn; the gated helper would return `6` — say so with a literal, and the comment above it carries the E0425 you are dodging.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+mod crate1 {
+    /// The private helper: E0603 for any outside caller.
+    fn hidden() -> u32 {
+        1
+    }
+    /// The public face — the E0603 dodge.
+    ///
+    /// TODO: return hidden()'s value.
+    pub fn open() -> u32 {
+        todo!()
+    }
+}
+
+mod crate2 {
+    pub const BASE: u32 = 5;
+    pub use self::BASE as REBASE; // re-export: the E0432 dodge
+    pub fn bonus() -> u32 {
+        2
+    }
+}
+
+/// E0428 lives in the notebook rule, not the code: a second
+/// `mod crate2 { .. }` here would end the notebook.
+///
+/// TODO: return crate2::REBASE + crate2::bonus().
+fn crate2_total() -> u32 {
+    todo!()
+}
+
+mod crate3 {
+    /// The gated helper: stripped under plain rustc — naming it is E0425.
+    #[cfg(test)]
+    pub fn gated() -> u32 {
+        6
+    }
+    pub const GATED_WOULD_BE: u32 = 6;
+}
+
+/// The E0425 dodge: report the value without naming the stripped item.
+///
+/// TODO: return crate3::GATED_WOULD_BE.
+fn stripped_call() -> u32 {
+    todo!()
+}
+
+// --- check (do not modify) ---
+assert_eq!(crate1::open(), 1);
+// crate1::hidden() would be:
+// error[E0603]: function `hidden` is private
+assert_eq!(crate2_total(), 7);
+assert_eq!(stripped_call(), 6);
+// crate3::gated() would be:
+// error[E0425]: cannot find function `gated` in module `crate3`
+println!("Exercise 8.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 11. Review: Mixed Problems
+
+Three problems, each assembling several sections' worth of machinery: a crate-root controller over a two-level tree, a facade with a `pub use` and a body-local variant import, and a test-suite rehearsal that runs the harness's shapes in process — every earlier exercise's move, used once more together.
+
+### Exercise 11.1 — The tree, driven from the root
+
+**Goal**: one controller function over the whole §1–§3 grammar — paths down two levels, a `pub(super)` item reached the only way it can be, and a downward privacy read.
+
+**Given**: the `hold` tree is complete except for three `TODO` bodies; the visibility knobs are already placed.
+
+**Objectives**
+
+- implement `hold::inner::peek` to return `hold::stash()`'s value — the downward read, `super::` from the child
+- implement `hold::open_stash` to return `inner::peek() + inner::for_parent()` — the parent consuming everything its child offers, the `pub(super)` fn included
+- implement `hold_report` in the root to return the trio of root-visible values — the wrapper fn, the constant, and the depth-two fn
+- keep the given tree and signatures unchanged; `hold::inner::for_parent()` from the root is the E0603 this exercise dodges
+
+**See**: §1.1, §2.1 and §3.1 of the example notebook.
+
+**Hint**: the child reads the parent with `super::stash()`; the root reads the tree as `hold::open_stash()`, `hold::LIMIT`, `hold::inner::deep()` — and `open_stash` is the only caller `for_parent` may ever have.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+mod hold {
+    /// The parent's private store.
+    ///
+    /// TODO: return 12.
+    fn stash() -> u32 {
+        todo!()
+    }
+
+    pub const LIMIT: u32 = 40;
+
+    /// The parent consuming everything its child offers — the downward read
+    /// and the pub(super) fn. This is for_parent's only legal caller.
+    ///
+    /// TODO: return inner::peek() + inner::for_parent().
+    pub fn open_stash() -> u32 {
+        todo!()
+    }
+
+    pub mod inner {
+        /// Downward privacy: the child reads the parent's private fn.
+        ///
+        /// TODO: return super::stash()'s value.
+        pub fn peek() -> u32 {
+            todo!()
+        }
+
+        /// Offered to the parent only — the pub(super) ceiling.
+        pub(super) fn for_parent() -> u32 {
+            13
+        }
+
+        /// Depth two, publicly reachable.
+        ///
+        /// TODO: return 14.
+        pub fn deep() -> u32 {
+            todo!()
+        }
+    }
+}
+
+/// The trio of root-visible values, named by path.
+///
+/// TODO: return (hold::open_stash(), hold::LIMIT, hold::inner::deep()).
+fn hold_report() -> (u32, u32, u32) {
+    todo!()
+}
+
+// --- check (do not modify) ---
+assert_eq!(hold_report(), (25, 40, 14)); // 12 + 13: both offerings consumed
+// hold::inner::for_parent() would be:
+// error[E0603]: function `for_parent` is private
+println!("Exercise 11.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+### Exercise 11.2 — The facade, used
+
+**Goal**: stand a consumer on top of the API-shaping move §4 taught — a facade module whose `pub use` lines are **given** (the spelling is the lesson, so read them) — and reach everything through the short names, including a body-local variant import.
+
+**Given**: the `raw` tree is complete, and the `facade` module's three `pub use` lines are complete — a struct re-exported under a new name, a constant under its own, a fn brought forward. From inside `facade`, `super::` is the shared root, so the lines read `pub use super::raw::store::Item as Part;` and so on.
+
+**Objectives**
+
+- implement `facade::facade_pick` to return the re-exported fn's value through its short facade path — `self::pick()`
+- implement `facade::assemble` to return `(self::LEVEL, Part { id: 7 }.id)` — both re-exports used by their short names
+- implement `engage` to import the variant `Mode::On` *inside the body* and return it
+- keep the given tree, the facade lines and the signatures unchanged
+
+**See**: §4.1 and §3.1 of the example notebook.
+
+**Hint**: inside the facade the re-exports are ordinary local items — `self::pick()`, `self::LEVEL`, `Part { .. }`. For the variant: `use crate::Mode::On;` then return it.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+mod raw {
+    pub mod store {
+        pub struct Item {
+            pub id: u32,
+        }
+    }
+    pub mod meter {
+        pub const LEVEL: u32 = 21;
+        /// The depth-two fn the facade will publish.
+        ///
+        /// TODO: return LEVEL's value.
+        pub fn pick() -> u32 {
+            todo!()
+        }
+    }
+}
+
+/// The facade: `pub use` shapes the API independent of the tree. The three
+/// lines are given — read them, then use the short names they create.
+mod facade {
+    pub use super::raw::store::Item as Part;
+    pub use super::raw::meter::LEVEL;
+    pub use super::raw::meter::pick;
+
+    /// The re-exported fn, reached through the facade's short path.
+    ///
+    /// TODO: return self::pick()'s value.
+    pub fn facade_pick() -> u32 {
+        todo!()
+    }
+
+    /// Both re-exports, used by their short names.
+    ///
+    /// TODO: return (self::LEVEL, Part { id: 7 }.id).
+    pub fn assemble() -> (u32, u32) {
+        todo!()
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum Mode {
+    On,
+    Off,
+}
+
+/// A body-local use of the variant — scoped to this function.
+///
+/// TODO: `use crate::Mode::On;` then return it.
+fn engage() -> Mode {
+    todo!()
+}
+
+// --- check (do not modify) ---
+assert_eq!(facade::facade_pick(), 21);
+assert_eq!(facade::assemble(), (21, 7));
+let _part: facade::Part = facade::Part { id: 7 }; // the re-exported struct builds
+assert_eq!(facade::LEVEL, 21);
+assert_eq!(engage(), Mode::On);
+println!("Exercise 11.2 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+### Exercise 11.3 — The test-suite rehearsal
+
+**Goal**: run the harness's whole vocabulary in process — plain assert, `Result` report, and a caught `should_panic` with its payload pinned — against one module, the way §6–§7 taught.
+
+**Given**: the `rehearsal` module is complete except for four `TODO` bodies; each doc comment states the harness shape its `#[test]` twin would carry.
+
+**Objectives**
+
+- implement `sum_top` to parse the first `n` rows and sum them, or fail on the first bad row — the fail-fast collect, `take` before the parse
+- implement `ratio` to return `a / b`, panicking with the literal `"zero divisor"` on `b == 0`
+- implement `split_total` to return the pair `(ratio(8, 2), 7)` — the values its failing `#[test]` twin would have reported
+- implement `suite_report` to return `(sum_top(&["10", "20", "x"], 1), sum_top(&["1", "1"], 2))` — a capped sum and a full sum, both as `Ok` because only parseable rows are summed
+- keep the module and signatures unchanged; the check does the harness's work: one read at a time, the panic caught and its `&str` payload demanded
+
+**See**: §6.1, §6.2 and §7 of the example notebook.
+
+**Hint**: `rows.iter().take(n).map(|r| r.parse::<u32>()).collect::<Result<Vec<u32>, _>>()` short-circuits on the first bad row — the fail-fast collect itself — and `.map(|v| v.iter().sum())` finishes the `Result`. For the payload, remember chapter 11: a literal `panic!` downcasts as `&str`.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+mod rehearsal {
+    /// The Result-returning shape: the first n rows parsed and summed, or
+    /// the first parse error — the fail-fast collect.
+    ///
+    /// TODO: replace `todo!()` with the take + map(parse) + Result-collect
+    /// body, then `.map(|v| v.iter().sum())`.
+    pub fn sum_top(rows: &[&str], n: usize) -> Result<u32, std::num::ParseIntError> {
+        todo!()
+    }
+
+    /// The should_panic shape: panics with "zero divisor" on b == 0.
+    ///
+    /// TODO: replace `todo!()` with the guard + division body.
+    pub fn ratio(a: u32, b: u32) -> u32 {
+        todo!()
+    }
+
+    /// The failing test's values, reported instead of asserted.
+    ///
+    /// TODO: replace `todo!()` with (ratio(8, 2), 7).
+    pub fn split_total() -> (u32, u32) {
+        todo!()
+    }
+}    /// The fail-fast pair: capped before the bad row, then all rows.
+    ///
+    /// TODO: replace `todo!()` with the sum_top pair — n = 1 over the first
+    /// argument (the cap stops before its bad third row), n = 2 over the
+    /// second.
+fn suite_report() -> (Result<u32, std::num::ParseIntError>, Result<u32, std::num::ParseIntError>) {
+    todo!()
+}
+
+// --- check (do not modify) ---
+assert_eq!(rehearsal::sum_top(&["10", "20"], 2), Ok(30));
+assert!(rehearsal::sum_top(&["10", "x"], 2).is_err()); // fail fast
+assert_eq!(rehearsal::ratio(9, 3), 3);
+let panicked = std::panic::catch_unwind(|| rehearsal::ratio(1, 0));
+let msg = panicked
+    .err()
+    // a literal panic! boxes a &'static str (chapter 11), not a String
+    .and_then(|payload| payload.downcast_ref::<&str>().copied())
+    .unwrap_or_default();
+assert_eq!(msg, "zero divisor");
+assert_eq!(rehearsal::split_total(), (4, 7));
+assert_eq!(suite_report(), (Ok(10), Ok(2)));
+println!("Exercise 11.3 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+### What Comes Next
+
+Chapter 13's fence grammar is now yours to write without looking anything up. The track continues:
+
+| Chapter | Title | What it settles |
+|---|---|---|
+| **14** | **Smart Pointers and Interior Mutability** | `Rc`/`RefCell` — sharing across the fence without publishing internals |
+| 15 | Data Types and Their Libraries | the crate as the unit you *consume*: dependencies, `polars` at library scale |
+| 16 | Concurrency | threads as modules with moving parts — and tests that isolate by construction |
+
+**Carry forward.** The ten moves this notebook drilled: drawing the `mod` tree and naming across it, placing the visibility knobs (`pub`, `pub(crate)`, `pub(super)`) so the smallest surface reads, anchoring paths with `crate::`/`super::`/`self::`, rewriting names with `use`/`as`/globs/`pub use`, exercising tests as ordinary functions — assert, `Result`, caught-and-pinned panics — and reading the five E-codes of the fence well enough to dodge each one live.
+</VSCode.Cell>

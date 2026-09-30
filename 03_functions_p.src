@@ -1,0 +1,696 @@
+<VSCode.Cell language="markdown">
+# Rust 103: Functions — Practice
+
+Companion exercises for `03_functions_e.ipynb`. Every section mirrors the section of the same number in the example notebook, and there is one exercise for each of its demonstration cells, so a `**See**` reference lands on the exact code that shows the technique.
+
+The checks at the bottom of each cell are the grader. Edit only the parts marked `TODO`; when a cell runs without panicking you will see an `Exercise N.M passed` line.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+### Contents
+
+- [0. How to Complete These Exercises](#0-how-to-complete-these-exercises)
+- [1. Function Basics](#1-function-basics)
+- [2. Parameters and Return Values](#2-parameters-and-return-values)
+- [3. Tail Expressions](#3-tail-expressions)
+- [4. Multiple Returns via Tuples](#4-multiple-returns-via-tuples)
+- [5. `const fn`](#5-const-fn)
+- [6. Closures and Anonymous Functions](#6-closures-and-anonymous-functions)
+- [7. Functions as First-Class Values](#7-functions-as-first-class-values)
+- [8. Higher-Order Functions](#8-higher-order-functions)
+- [9. Generic Functions](#9-generic-functions)
+- [10. Lifetimes in Function Signatures](#10-lifetimes-in-function-signatures)
+- [11. Why Rust Has No Overloading](#11-why-rust-has-no-overloading)
+- [12. Inline Functions](#12-inline-functions)
+- [13. Error Handling with `Result`](#13-error-handling-with-result)
+- [14. Diverging Functions](#14-diverging-functions)
+- [15. Function Pointers vs Closures](#15-function-pointers-vs-closures)
+- [16. Review: Mixed Problems](#16-review-mixed-problems)
+
+Each of §1–§15 has one exercise for the demonstration cell of the same number; §16 mixes them. When a check fails, §16 of the example notebook is the fastest route back.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 0. How to Complete These Exercises
+
+This notebook runs on the same **evcxr** kernel as the example notebook. Three consequences shape how you work:
+
+1. **No `fn main`.** The body of a cell *is* the body of `main`. Type statements directly.
+2. **State persists.** A binding from one cell is visible in every cell below it.
+3. **Items are order-independent.** A `fn`, a `const` or a `use` line may be used above the cell that defines it.
+
+A fourth consequence bites harder here than anywhere else in the track, because every exercise defines functions:
+
+> **Item names must be unique across the whole notebook.** Every cell shares one namespace, so two functions with the same name are a redefinition error, even in different sections. If the compiler says a name "is defined multiple times", it is pointing at an *earlier* cell. Rename the new one.
+
+### The stub convention
+
+Each exercise cell declares a signature, a doc comment stating the contract, and a `// --- check (do not modify) ---` block of `assert_eq!`/`assert!` calls. The body you must fill in is `todo!()`, which compiles but **panics** when executed:
+
+```text
+thread '<main>' panicked at ... not yet implemented
+```
+
+Replace the `todo!()` and re-run the cell. An `Exercise N.M passed` line means you are done.
+
+### Expect warnings until you finish
+
+Every unsolved stub whose parameters are untouched emits `unused variable`, so a fresh notebook shows a long list of them. That is normal and self-cleaning: each warning disappears when you implement the body. If a diagnostic appears that is not in that list, it is yours.
+
+Two practical notes:
+
+- Re-running a cell that *defines* a function redefines it. On a `cannot define ... twice` error, restart the kernel and run the cells again.
+- Errors reported by the kernel are plain `rustc` errors. Read them from the top, fix the first one, and re-run — the later ones are usually knock-on.
+
+**See**: §0 and §15 of the example notebook.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+### Exercise 0.1 — The kernel is alive
+
+**Goal**: prove a cell compiles, runs and reports a result.
+
+**Given**: nothing; this is the smoke test.
+
+**Objectives**
+
+- implement `add_one` so it returns exactly one more than its argument
+- keep the signature unchanged
+
+**See**: §0.1 and §1.1 of the example notebook.
+
+**Hint**: the body can be a single expression with **no** semicolon.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+/// Return `x` plus one.
+///
+/// TODO: replace `todo!()` with the incremented value.
+fn add_one(x: i32) -> i32 {
+    todo!()
+}
+
+// --- check (do not modify) ---
+assert_eq!(add_one(5), 6);
+assert_eq!(add_one(-2), -1);
+assert_eq!(add_one(0), 1);
+println!("Exercise 0.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 1. Function Basics
+
+### Exercise 1.1 — A function that prints
+
+**Goal**: declare a function whose job is an effect, not a value.
+
+**Info**: A function with no `->` type returns `()`. Printing functions are the smallest example of that contract.
+
+**Objectives**
+
+- implement `greet_message` so it prints exactly `Hello from a function`
+- keep the signature unchanged
+
+**See**: §1.1 of the example notebook.
+
+**Hint**: one `println!` with a fixed string.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+/// Print exactly `Hello from a function`.
+///
+/// TODO: replace `todo!()` with the print.
+fn greet_message() {
+    todo!()
+}
+
+// --- check (do not modify) ---
+greet_message();
+println!("Exercise 1.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 2. Parameters and Return Values
+
+### Exercise 2.1 — Two parameters, one product
+
+**Goal**: pass two typed parameters and return the computed result.
+
+**Info**: Every parameter needs an explicit type, and the return type follows `->`. There is no inference on signatures: the caller reads the contract, not the body.
+
+**Objectives**
+
+- return the product of `width` and `height`
+- keep the signature unchanged
+
+**See**: §2.1 of the example notebook.
+
+**Hint**: a tail expression; no `return` needed.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+/// Return `width * height`.
+///
+/// TODO: replace `todo!()` with the product.
+fn area(width: i32, height: i32) -> i32 {
+    todo!()
+}
+
+// --- check (do not modify) ---
+assert_eq!(area(3, 4), 12);
+assert_eq!(area(5, 5), 25);
+assert_eq!(area(0, 7), 0);
+assert_eq!(area(-2, 3), -6);
+println!("Exercise 2.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 3. Tail Expressions
+
+### Exercise 3.1 — Return without `return`
+
+**Goal**: produce a value through the tail expression only.
+
+**Info**: The last expression of the body *is* the return value. Adding a semicolon would turn it into a statement of type `()` and stop compiling against a non-`()` return type.
+
+**Objectives**
+
+- return twice the argument
+- do not use the `return` keyword, and do not end the final expression with a semicolon
+- keep the signature unchanged
+
+**See**: §3.1 of the example notebook.
+
+**Hint**: `x * 2`, as the last line, bare.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+/// Return twice `n`, via the tail expression.
+///
+/// TODO: replace `todo!()` with the doubled value.
+fn tail_double(n: i32) -> i32 {
+    todo!()
+}
+
+// --- check (do not modify) ---
+assert_eq!(tail_double(21), 42);
+assert_eq!(tail_double(-4), -8);
+assert_eq!(tail_double(0), 0);
+println!("Exercise 3.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 4. Multiple Returns via Tuples
+
+### Exercise 4.1 — Quotient and remainder together
+
+**Goal**: return two related values as one tuple.
+
+**Info**: Rust has no multi-value return; a tuple is the mechanism, and the caller destructures it with a pattern. `/` truncates toward zero and `%` takes the sign of the left operand — worth checking against negative inputs once, here.
+
+**Objectives**
+
+- return `(a / b, a % b)` as one tuple
+- keep the signature unchanged
+
+**See**: §4.1 of the example notebook.
+
+**Hint**: build the tuple directly; no `if` is needed.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+/// Return `(quotient, remainder)` of `a` divided by `b`.
+///
+/// TODO: replace `todo!()` with the pair.
+fn div_rem(a: i32, b: i32) -> (i32, i32) {
+    todo!()
+}
+
+// --- check (do not modify) ---
+assert_eq!(div_rem(17, 5), (3, 2));
+assert_eq!(div_rem(-17, 5), (-3, -2));
+assert_eq!(div_rem(17, -5), (-3, 2));
+assert_eq!(div_rem(5, 5), (1, 0));
+println!("Exercise 4.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 5. `const fn`
+
+### Exercise 5.1 — Evaluated at compile time
+
+**Goal**: feed a `const` from a `const fn`.
+
+**Info**: `const fn` is about *where* evaluation is permitted, not about runtime speed. Calling one to initialise a `const` forces the computation into the compiler, which has two consequences for this exercise. First, the placeholder body below is `0`, **not** `todo!()`: an unsolved `todo!()` inside a `const` initializer is a compile-time error (`E0080`), not the usual runtime panic, because the initializer has no runtime to panic in. Second, the real body may only use operations that are legal in `const` context — of which `*` is one.
+
+**Objectives**
+
+- implement `square_const` as a `const fn` returning `x * x`
+- keep the signature and the `const SQUARED` line unchanged — the body is the exercise
+- keep the signature unchanged
+
+**See**: §5.1 of the example notebook.
+
+**Hint**: the given body already compiles; it just needs the real expression instead of the panic.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+/// Return `x` squared, computable at compile time.
+///
+/// TODO: replace the placeholder `0` with `x` squared. (The placeholder is not
+/// `todo!()` here: see the Info above.)
+const fn square_const(x: i64) -> i64 {
+    0
+}
+const SQUARED: i64 = square_const(9);
+
+// --- check (do not modify) ---
+assert_eq!(SQUARED, 81);
+assert_eq!(square_const(5), 25);
+assert_eq!(square_const(-3), 9);
+println!("Exercise 5.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 6. Closures and Anonymous Functions
+
+### Exercise 6.1 — A closure inside a function
+
+**Goal**: bind a closure to a local and call it.
+
+**Info**: A closure is a value, so it is bound with `let` like any other. Its parameter types may be inferred from the first call, though writing them is never wrong.
+
+**Objectives**
+
+- inside `tripler`, bind a closure that multiplies by 3, then call it on `n` and return the result
+- keep the signature unchanged
+
+**See**: §6.1 of the example notebook.
+
+**Hint**: `let triple = |x: i32| ...;` followed by a call.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+/// Return `n` multiplied by 3, through a closure bound locally.
+///
+/// TODO: replace `todo!()` with the closure and the call.
+fn tripler(n: i32) -> i32 {
+    todo!()
+}
+
+// --- check (do not modify) ---
+assert_eq!(tripler(5), 15);
+assert_eq!(tripler(-2), -6);
+assert_eq!(tripler(0), 0);
+println!("Exercise 6.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 7. Functions as First-Class Values
+
+### Exercise 7.1 — Coerce a function to a pointer
+
+**Goal**: pass a named function where a `fn` pointer is expected.
+
+**Info**: A named function coerces to a function pointer when the signature matches. The pointer type is written `fn(param_types) -> return_type` — no `&`, no generics.
+
+**Objectives**
+
+- implement `multiply` returning the product of its arguments
+- the check block assigns it to a `fn(i32, i32) -> i32` and calls through the pointer
+- keep the signature unchanged
+
+**See**: §7.1 of the example notebook.
+
+**Hint**: the body is one tail expression; the coercion is the check block's job.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+/// Return the product of `a` and `b`.
+///
+/// TODO: replace `todo!()` with the product.
+fn multiply(a: i32, b: i32) -> i32 {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let f: fn(i32, i32) -> i32 = multiply;
+assert_eq!(f(3, 4), 12);
+assert_eq!(f(0, 9), 0);
+assert_eq!(multiply(2, 2), 4);
+println!("Exercise 7.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 8. Higher-Order Functions
+
+### Exercise 8.1 — Apply a function n times
+
+**Goal**: receive behaviour as a parameter and loop over it.
+
+**Info**: A `fn` pointer parameter carries behaviour; the other parameters carry data. `n == 0` must return `x` unchanged, which makes the loop body run zero times.
+
+**Objectives**
+
+- apply `f` to `x` exactly `n` times in a row
+- return `x` unchanged when `n` is 0
+- keep the signature unchanged
+
+**See**: §8.1 of the example notebook.
+
+**Hint**: a `for` loop over `0..n`, rebinding `current` each iteration.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+/// Apply `f` to `x`, `n` times in a row.
+///
+/// TODO: replace `todo!()` with the loop.
+fn apply_n_times(f: fn(i32) -> i32, x: i32, n: usize) -> i32 {
+    todo!()
+}
+
+// --- check (do not modify) ---
+assert_eq!(apply_n_times(plus_one, 5, 3), 8);
+assert_eq!(apply_n_times(plus_one, 5, 0), 5);
+assert_eq!(apply_n_times(double, 3, 2), 12);
+assert_eq!(apply_n_times(plus_one, 7, 1), 8);
+println!("Exercise 8.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 9. Generic Functions
+
+### Exercise 9.1 — One signature, many types
+
+**Goal**: write a function whose parameter and return type are the same generic `T`.
+
+**Info**: An unconstrained generic must be valid for every `T` — so the only things the body may do are the things every type supports. Returning the value unchanged is the canonical example.
+
+**Objectives**
+
+- return the first element of `pair`
+- keep the signature generic over `T`
+- keep the signature unchanged
+
+**See**: §9.1 of the example notebook.
+
+**Hint**: tuple field access works on every tuple, whatever `T` is.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+/// Return the first element of `pair`.
+///
+/// TODO: replace `todo!()` with the element.
+// (a plain comment, not a doc comment: this stub sits inside a macro call)
+fn first_of_pair<T>(pair: (T, T)) -> T {
+    todo!()
+}
+
+// --- check (do not modify) ---
+assert_eq!(first_of_pair((1, 2)), 1);
+assert_eq!(first_of_pair(('a', 'b')), 'a');
+assert_eq!(first_of_pair(("x", "y")), "x");
+println!("Exercise 9.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 10. Lifetimes in Function Signatures
+
+### Exercise 10.1 — Return the longer borrow
+
+**Goal**: tie a returned reference to the inputs it may come from.
+
+**Info**: Because the function may return *either* input, the compiler needs a name for the relationship "the result lives no longer than both inputs". That name is `'a`, written once on each reference involved.
+
+**Objectives**
+
+- return whichever of `x` and `y` is longer, borrowing from the inputs
+- when the lengths are equal, return `x`
+- keep the signature unchanged, `'a` included
+
+**See**: §10.1 of the example notebook.
+
+**Hint**: one `if`/`else` on `len()`, each arm returning a slice.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+/// Return the longer of `x` and `y`; on a tie, return `x`.
+///
+/// TODO: replace `todo!()` with the comparison.
+// (a plain comment, not a doc comment: this stub sits inside a macro call)
+fn longer_of<'a>(x: &'a str, y: &'a str) -> &'a str {
+    todo!()
+}
+
+// --- check (do not modify) ---
+assert_eq!(longer_of("short", "longer"), "longer");
+assert_eq!(longer_of("ab", "cd"), "ab");
+assert_eq!(longer_of("x", ""), "x");
+println!("Exercise 10.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 11. Why Rust Has No Overloading
+
+### Exercise 11.1 — Two names, two types
+
+**Goal**: express what another language would write as two overloads.
+
+**Info**: Rust resolves calls by name only. Two operations on different types get different names — or share one generic signature with a trait bound, which is §9's tool.
+
+**Objectives**
+
+- implement `add_i32` returning the sum of two `i32`
+- implement `add_f64` returning the sum of two `f64`
+- keep both signatures unchanged
+
+**See**: §11 of the example notebook.
+
+**Hint**: two functions, two names, one idea each.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+/// Return the sum of two `i32` values.
+///
+/// TODO: replace `todo!()` with the sum.
+fn add_i32(a: i32, b: i32) -> i32 {
+    todo!()
+}
+
+/// Return the sum of two `f64` values.
+///
+/// TODO: replace `todo!()` with the sum.
+fn add_f64(a: f64, b: f64) -> f64 {
+    todo!()
+}
+
+// --- check (do not modify) ---
+assert_eq!(add_i32(2, 3), 5);
+assert_eq!(add_i32(-1, 1), 0);
+assert_eq!(add_f64(2.5, 3.5), 6.0);
+assert_eq!(add_f64(-0.5, 0.25), -0.25);
+println!("Exercise 11.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 12. Inline Functions
+
+### Exercise 12.1 — Hint the optimizer
+
+**Goal**: attach `#[inline]` to a small function.
+
+**Info**: `#[inline]` is a hint, not a command: the optimizer still decides. It matters mainly for small cross-crate functions; within one crate the optimizer inlines on its own.
+
+**Objectives**
+
+- implement `fast_mul` returning the product of its arguments
+- mark it with the `#[inline]` attribute, above the `fn` line
+- keep the signature unchanged
+
+**See**: §12.1 of the example notebook.
+
+**Hint**: the attribute goes on its own line, directly above the `fn`.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+/// Return the product of `a` and `b`, marked as an inlining hint.
+///
+/// TODO: replace `todo!()` with the product.
+#[inline]
+fn fast_mul(a: i32, b: i32) -> i32 {
+    todo!()
+}
+
+// --- check (do not modify) ---
+assert_eq!(fast_mul(2, 3), 6);
+assert_eq!(fast_mul(-4, 5), -20);
+assert_eq!(fast_mul(0, 7), 0);
+println!("Exercise 12.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 13. Error Handling with `Result`
+
+### Exercise 13.1 — Failure as a return type
+
+**Goal**: propagate a parse failure instead of panicking on it.
+
+**Info**: `str::parse::<i32>()` already returns exactly the type this exercise wants. The exercise is noticing that the error type travels in the signature — the caller can see the failure mode without reading the body.
+
+**Objectives**
+
+- return the outcome of parsing `text` as an `i32`
+- do not `unwrap`, `expect` or panic: the caller handles the `Err` arm
+- keep the signature unchanged
+
+**See**: §13.1 of the example notebook.
+
+**Hint**: `text.parse::<i32>()` is the whole body.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+/// Parse `text` as an `i32`, or return the parse error.
+///
+/// TODO: replace `todo!()` with the parse.
+fn parse_num(text: &str) -> Result<i32, std::num::ParseIntError> {
+    todo!()
+}
+
+// --- check (do not modify) ---
+assert_eq!(parse_num("42"), Ok(42));
+assert_eq!(parse_num("-7"), Ok(-7));
+assert!(parse_num("oops").is_err());
+assert!(parse_num("").is_err());
+println!("Exercise 13.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 14. Diverging Functions
+
+### Exercise 14.1 — A function that never returns
+
+**Goal**: write a function whose type says normal return is impossible.
+
+**Info**: `-> !` is the *never* type. The body must diverge — panic, loop forever, or exit the process — and because a diverging expression fits any expected type, such a function can be called where a value is required.
+
+**Objectives**
+
+- implement `explode` so it panics with `msg`
+- keep the `-> !` return type unchanged
+- leave the call in the check block commented out: actually calling it would end the kernel session
+
+**See**: §14.1 of the example notebook.
+
+**Hint**: the `panic!` macro takes the message as its argument.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+/// Panic with `msg`. Never returns.
+///
+/// TODO: replace `todo!()` with the panic.
+#[allow(dead_code)] // never called: calling it would end the kernel session
+fn explode(msg: &str) -> ! {
+    todo!()
+}
+
+// --- check (do not modify) ---
+// Uncomment to see the panic end the run:
+// explode("boom");
+println!("Exercise 14.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 15. Function Pointers vs Closures
+
+### Exercise 15.1 — Pointer and closure, side by side
+
+**Goal**: feel the difference between naming code and capturing an environment.
+
+**Info**: A `fn` pointer is a bare address: no captured state. A closure that uses a variable from its surroundings carries that variable, which is why only a non-capturing closure can convert to a `fn` pointer.
+
+**Objectives**
+
+- implement `sum` returning the total of its arguments
+- the check block stores it in a `fn(i32, i32) -> i32`, builds a closure that captures `offset`, and compares both results
+- keep the signature unchanged
+
+**See**: §15.1 of the example notebook.
+
+**Hint**: the body is one tail expression; the captured variable is declared in the check block.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+/// Return the total of `a` and `b`.
+///
+/// TODO: replace `todo!()` with the sum.
+fn sum(a: i32, b: i32) -> i32 {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let f: fn(i32, i32) -> i32 = sum;
+assert_eq!(f(2, 3), 5);
+let offset = 10;
+let add_offset = |a: i32, b: i32| a + b + offset;
+assert_eq!(add_offset(2, 3), 15);
+assert_eq!(sum(2, 3), add_offset(2, 3) - offset);
+println!("Exercise 15.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 16. Review: Mixed Problems
+
+### Exercise 16.1 — Compose two functions
+
+**Goal**: chain two function pointers through one generic-free signature.
+
+**Info**: Composition is the purest higher-order operation: `compose(f, g)(x) == g(f(x))`. With `fn` pointers the types stay concrete and nothing is captured.
+
+**Objectives**
+
+- return `g` applied to the result of `f` applied to `x`
+- keep the signature unchanged
+
+**See**: §8.1 and §15.1 of the example notebook.
+
+**Hint**: one expression, two calls, read inside out.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+/// Return `g(f(x))`.
+///
+/// TODO: replace `todo!()` with the composition.
+fn compose(f: fn(i32) -> i32, g: fn(i32) -> i32, x: i32) -> i32 {
+    todo!()
+}
+
+// --- check (do not modify) ---
+fn plus_one(v: i32) -> i32 {
+    v + 1
+}
+fn double(v: i32) -> i32 {
+    v * 2
+}
+assert_eq!(compose(plus_one, double, 5), 12);
+assert_eq!(compose(double, plus_one, 5), 11);
+assert_eq!(compose(plus_one, plus_one, 0), 2);
+assert_eq!(compose(double, double, 1), 4);
+println!("Exercise 16.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+### Exercise 16.2 — Division that reports instead of panicking
+
+**Goal**: turn a panicking operation into an `Option`-returning contract.
+
+**Info**: `a / b` panics on a zero divisor; the division itself is fine otherwise, including with negative operands, because `/` truncates toward zero. Returning `Option<i32>` moves the failure from runtime panic to the type, where every caller must deal with it.
+
+**Objectives**
+
+- return `None` when `b` is zero
+- return `Some(a / b)` otherwise
+- keep the signature unchanged
+
+**See**: §13.1 and §4.1 of the example notebook.
+
+**Hint**: one `if` on the divisor; the arithmetic is the ordinary operator.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+/// Return `a / b`, or `None` when `b` is zero.
+///
+/// TODO: replace `todo!()` with the guarded division.
+fn safe_div(a: i32, b: i32) -> Option<i32> {
+    todo!()
+}
+
+// --- check (do not modify) ---
+assert_eq!(safe_div(10, 2), Some(5));
+assert_eq!(safe_div(7, -2), Some(-3));
+assert_eq!(safe_div(1, 0), None);
+assert_eq!(safe_div(0, 5), Some(0));
+println!("Exercise 16.2 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+### What Comes Next
+
+Every exercise here was an exercise in *signatures*: what enters, what leaves, and who owns it along the way. The one question this chapter deliberately left open — what happens to a value that is passed in, returned, or borrowed — is the entire subject of the next two chapters.
+
+| Chapter | Title | What it settles |
+|---|---|---|
+| **04** | **Strings** | `String` versus `&str` in signatures, UTF-8, and the method inventory for text |
+| **05** | **Ownership and Borrowing** | Moves, copies, borrows and lifetimes — why `fn f(s: String)` and `fn f(&str)` are different contracts |
+| 06 | Native Collections | `Vec`, `HashMap`, `VecDeque`, and the iterator methods that consume closures like §6's |
+
+**Carry forward.** You should now be able to do these without looking anything up:
+
+- read a signature and say what the caller must provide and what the function promises
+- write a tail expression, and predict the `E0308` a stray semicolon produces
+- return two values as a tuple and destructure them at the call site
+- choose between a `fn` pointer, a closure, and a generic `impl Fn` bound
+- let `?` carry a `Result` outward instead of panicking on it
+
+If any of those still needs looking up, §16 of the example notebook is the one-page answer, and re-running the matching exercise here is the check.
+</VSCode.Cell>

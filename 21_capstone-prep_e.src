@@ -1,0 +1,525 @@
+<VSCode.Cell language="markdown">
+# Rust 121: Capstone Prep and Real-World Practice
+
+The last chapter of *reading* before the last chapter of *building*. A capstone assembles crates (17–20's feed, cache, storage, kernel), and assembly is a skill with its own tools: **reading a crate's docs and CHANGELOG before trusting it**, **steering the dependency graph with `cargo add` and feature flags**, **keeping error handling coherent across crate boundaries**, **measuring with criterion instead of guessing**, and **structuring a small service so the capstone is assembly, not archaeology**.
+
+No new crates enter the notebook: the kernel cells stay std-only (the two-track rule), and the heavy tools — criterion, `cargo add`, the registry — live in the **spike21 desk**, whose command receipts are quoted inline. One mirror per skill runs here so you can execute the shape behind each receipt.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+### Contents
+
+- [0. Notebook Conventions: How These Cells Run](#0-notebook-conventions-how-these-cells-run)
+- [1. Reading Docs and CHANGELOGs](#1-reading-docs-and-changelogs)
+- [2. `cargo add`, Feature Flags, and the Tree](#2-cargo-add-feature-flags-and-the-tree)
+- [3. Errors Across Crate Boundaries](#3-errors-across-crate-boundaries)
+- [4. Benchmarking with Criterion](#4-benchmarking-with-criterion)
+- [5. Structuring a Small Multi-Module Service](#5-structuring-a-small-multi-module-service)
+- [6. Choosing the Capstone Scope](#6-choosing-the-capstone-scope)
+- [7. Reading the Compiler: E-Codes](#7-reading-the-compiler-e-codes)
+- [8. Mental Model: The Receipts](#8-mental-model-the-receipts)
+- [9. Cheat Sheet](#9-cheat-sheet)
+- [10. Review](#10-review)
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 0. Notebook Conventions: How These Cells Run
+
+This notebook runs on the same **evcxr** kernel as every chapter. Three consequences shape how you work:
+
+1. **No `fn main`.** The body of a cell *is* the body of `main`. Type statements directly.
+2. **State persists.** A binding from an earlier cell is visible in every cell below it — including `use` lines.
+3. **Items are order-independent.** A struct or fn may be used above the cell that defines it.
+
+> **Item names must be unique across the whole notebook.** Every cell shares one namespace; two functions with the same name are a redefinition error even in different sections. The same rule covers `use` lines: the first cell that needs a name is the one that imports; later cells rely on persistence — a repeated `use` is E0252.
+
+### The chapter's desk: spike21
+
+The heavy tools cannot load in the kernel — criterion is a test-harness crate, `cargo add` edits manifests — so they run in the scratch project and this notebook quotes their receipts:
+
+```text
+C:/Users/GSL/AppData/Local/Temp/spike21/
+  Cargo.toml        [dev-dependencies] criterion = "0.8";  [[bench]] name = "desk", harness = false
+  src/lib.rs        price_slow (the honest loop) and price_fast (the closed form)
+  benches/desk.rs   the criterion group: throughput + black_box + two benches
+  tests/equiv.rs    the gate: price_slow(&rows) == price_fast(&rows)
+```
+
+Every section that uses the desk shows its receipt inline, like the benchmark line:
+
+```text
+desk/fast               time:   [82.647 ns 83.181 ns 83.765 ns]
+```
+
+### Verify before trusting (the chapter's own habit, applied to itself)
+
+- `cargo tree --depth 1` in spike21 → `criterion v0.8.2` under `[dev-dependencies]`
+- `python --version` is *not* needed here; `rustc --version` → **1.98.1**
+- `echo $CARGO_HOME` → **`C:\DEV\Rust\.cargo`** — non-default on this machine, which matters when a README says "check the registry cache"
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 0.1 The desk map, printed: what lives where, and the two kernels the
+// chapter benchmarks.
+let desk = std::collections::HashMap::from([
+    ("manifest", "dev-dependencies: criterion = \"0.8\"; [[bench]] desk, harness = false"),
+    ("lib", "price_slow (loop) + price_fast (closed form)"),
+    ("bench", "criterion_group + Throughput::Elements + black_box"),
+    ("test", "tests/equiv.rs: slow == fast, the gate before the speed claim"),
+]);
+for (k, v) in &desk {
+    println!("{:>8}: {}", k, v);
+}
+// the two kernels, up here where the kernel can run them: §4.1 mirrors
+// the benchmark that spike21 runs on exactly this shape
+fn price_slow(rows: &[i64]) -> Vec<i64> {
+    rows.iter().map(|&r| (0..r.min(64)).map(|k| k * 2).sum()).collect()
+}
+fn price_fast(rows: &[i64]) -> Vec<i64> {
+    rows.iter().map(|&r| { let n = r.min(64); n * (n - 1) }).collect()
+}
+let rows: Vec<i64> = (1..=200).collect();
+assert_eq!(price_slow(&rows), price_fast(&rows));
+println!("kernels agree on 200 rows — receipts below measure them");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 1. Reading Docs and CHANGELOGs
+
+The skill that separates "copied from a blog post" from "knows what it linked": **before a crate enters the manifest, three artifacts get read**.
+
+**docs.rs — the feature surface.** A crate's docs.rs page has a *Feature flags* panel listing every cargo feature and what it gates. Read it before `cargo add`: this series already lived the lesson — reqwest's `stream` feature gates `bytes_stream` (§17), sqlx's `macros` feature gates `query!` (§19), tokio's `tokio-comp` gates redis's async (§18). A method that does not compile without a feature is not a bug in your code; it is a flag you did not enable, and the docs page says so in one click.
+
+**CHANGELOG — the crate's history.** Keep-a-Changelog format, newest first: `## [0.8.2](compare-link) - 2026-02-04` then `### Fixed` / `### Added` / `### Breaking`. Read the span between the version you are pinning and the one your tutorials were written against. criterion's own changelog (cached on this machine) is the artifact to practice on:
+
+```text
+C:/DEV/Rust/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/criterion-0.8.2/CHANGELOG.md
+```
+
+**The registry cache — where the sources actually are.** Every crate you build is unpacked under `$CARGO_HOME/registry/src/<registry-hash>/<name>-<version>/`, readable source, license, and changelog included. On this machine `CARGO_HOME` is `C:\DEV\Rust\.cargo` — a reminder that **the default (`~/.cargo`) is a default, not a law**: check the variable before quoting the path in a README or a Dockerfile.
+
+**SemVer, the promise under all of it.** `0.8.2` = breaking `0` minor `8` patch `2`. Cargo's `"0.8"` caret allows `0.8.x` only — a lockfile (§2's `cargo tree` verifies the graph) is how a team keeps every build reproducible while patches flow.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 2. `cargo add`, Feature Flags, and the Tree
+
+Adding a dependency is a manifest edit, but doing it by hand is how versions drift. The receipts, from spike21:
+
+```text
+$ cargo add serde --dry-run
+    Adding serde v1.0.229 to dependencies
+             features list
+             + derive
+             - alloc
+             - rc
+             ...
+warning: aborting add due to dry run
+```
+
+```text
+$ cargo add serde --features derive --dry-run
+             + derive        <- moved from the optional list to the enabled set
+warning: aborting add due to dry run
+```
+
+Three habits in those two commands:
+
+- **`--dry-run` first, always.** The tool prints the version it resolved, the dependency it would add, and the **full feature inventory** — `+` enabled, `-` available — then aborts. You see the whole flag surface before anything is written.
+- **Features are the dependency budget.** `--features derive` moved one flag; every flag you enable can pull crates (derive pulls `serde_derive` and `syn`, the compile-time cost of §0.1's macros). The probed truth from §15–19: this series' manifests name flags explicitly (`default-features = false` on sqlx and redis) precisely because defaults are marketing, not fit.
+- **`cargo tree` is the graph.** `cargo tree --depth 1` shows the first ring of spike21's graph; drop the flag for the full transitive closure. Feature unification — the reason chapter 19's rlib hashes all moved when sqlx joined — is visible here as the reason two crates sharing tokio get *one* tokio, features merged.
+
+The version a `cargo add` resolves is written to `Cargo.toml` as a caret requirement (`"1.0"` means `>=1.0, <2.0`); **`Cargo.lock` pins the exact versions** and is the file a team commits. The desk's lockfile is how §4's baselines stay comparable tomorrow.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 3. Errors Across Crate Boundaries
+
+The capstone wires four crates, each with its own error type: `reqwest::Error` (the feed), `redis::RedisError` (the cache), `sqlx::Error` (storage), and — at the last boundary — `PyErr` (the Python host, §20). A service that lets those four types leak into every signature has no error story; the shape that works is **one domain error per service, `From` impls at each boundary, `?` everywhere else**:
+
+```rust
+#[derive(Debug)]
+enum ServiceError {
+    Feed(String),     // from reqwest::Error
+    Cache(String),    // from redis::RedisError
+    Store(String),    // from sqlx::Error
+    Overflow,         // the domain's own
+}
+
+impl From<reqwest::Error> for ServiceError {
+    fn from(e: reqwest::Error) -> Self { ServiceError::Feed(e.to_string()) }
+}
+impl From<redis::RedisError> for ServiceError {
+    fn from(e: redis::RedisError) -> Self { ServiceError::Cache(e.to_string()) }
+}
+impl From<sqlx::Error> for ServiceError {
+    fn from(e: sqlx::Error) -> Self { ServiceError::Store(e.to_string()) }
+}
+```
+
+after which one pipeline signature — `Result<Fill, ServiceError>` — composes every crate with plain `?`:
+
+```rust
+fn best_price(sym: &str) -> Result<i64, ServiceError> {
+    let cached: Option<i64> = cache_get(sym)?;        // redis::Error -> Cache
+    match cached {
+        Some(px) => Ok(px),
+        None => {
+            let px: Px = feed_get(sym)?;              // reqwest::Error -> Feed
+            cache_put(sym, px)?;                      // redis again
+            Ok(px.value())
+        }
+    }
+}
+```
+
+Three rules that keep it coherent as the service grows:
+
+1. **Convert at the boundary, not at the call site.** The `From` impl is written once per crate; every `?` after it is uniform. Formatting the error into a `String` ad hoc at ten call sites is ten formats to keep consistent.
+2. **Preserve the layering** (chapter 11): `source()` chains the wrapped error for logs; `Display` names the layer that failed ("cache: connection refused", not just "connection refused").
+3. **The outermost boundary decides the final dialect.** When the service is a pyo3 module, the *last* impl is `From<ServiceError> for PyErr` — one conversion for the whole domain, exactly §20's payload rule applied at service scale.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 3.1 The pattern in kernel-honest Rust: two fake crate errors, one domain
+// error, From at each boundary, one pipeline with ?.
+#[derive(Debug)]
+enum FeedErr {
+    Timeout,
+    Status(u16),
+}
+
+#[derive(Debug)]
+enum CacheErr {
+    Down,
+}
+
+#[derive(Debug, PartialEq)]
+enum ServiceError {
+    Feed(String),
+    Cache(String),
+}
+
+impl std::fmt::Display for ServiceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ServiceError::Feed(m) => write!(f, "feed: {m}"),
+            ServiceError::Cache(m) => write!(f, "cache: {m}"),
+        }
+    }
+}
+
+impl From<FeedErr> for ServiceError {
+    fn from(e: FeedErr) -> Self {
+        match e {
+            FeedErr::Timeout => ServiceError::Feed("timeout".to_string()),
+            FeedErr::Status(c) => ServiceError::Feed(format!("status {c}")),
+        }
+    }
+}
+
+impl From<CacheErr> for ServiceError {
+    fn from(_e: CacheErr) -> Self {
+        ServiceError::Cache("down".to_string())
+    }
+}
+
+// the "crates", as stub clients with the real shapes
+struct Feed;
+impl Feed {
+    fn get(&self, sym: &str) -> Result<i64, FeedErr> {
+        if sym == "BAD" {
+            Err(FeedErr::Status(404))
+        } else if sym == "SLOW" {
+            Err(FeedErr::Timeout)
+        } else {
+            Ok(42)
+        }
+    }
+}
+struct Cache(std::collections::HashMap<String, i64>);
+impl Cache {
+    fn get(&self, sym: &str) -> Result<Option<i64>, CacheErr> {
+        Ok(self.0.get(sym).copied())
+    }
+    fn put(&mut self, sym: &str, px: i64) -> Result<(), CacheErr> {
+        self.0.insert(sym.to_string(), px);
+        Ok(())
+    }
+}
+
+// the pipeline: ONE signature, THREE ?, zero error-formatting at call sites
+fn best_price(cache: &mut Cache, sym: &str) -> Result<i64, ServiceError> {
+    match cache.get(sym)? {
+        Some(px) => Ok(px),
+        None => {
+            let px = Feed.get(sym)?;
+            cache.put(sym, px)?;
+            Ok(px)
+        }
+    }
+}
+
+let mut cache = Cache(std::collections::HashMap::new());
+assert_eq!(best_price(&mut cache, "AAA"), Ok(42));
+assert_eq!(best_price(&mut cache, "AAA"), Ok(42), "second read hits the cache");
+assert_eq!(
+    best_price(&mut cache, "BAD").unwrap_err().to_string(),
+    "feed: status 404",
+    "the layer names itself — Display carries the boundary"
+);
+assert_eq!(
+    best_price(&mut cache, "SLOW").unwrap_err().to_string(),
+    "feed: timeout"
+);
+assert_eq!(
+    ServiceError::from(CacheErr::Down).to_string(),
+    "cache: down"
+);
+println!("one domain error, From at each boundary, ? everywhere: 42/42/404");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+Two reads. **`?` did all the routing**: three calls, three different sources of failure, one signature — the `From` impls written once at the top of the service are why the pipeline reads like the happy path. **`Display` names the layer** because at 3 a.m. the log line `"cache: down"` is triaged in seconds while `"down"` is a guessing game — the same discipline as §19's SQLSTATE codes, applied to your own errors. Chapter 11's rules survive scaling up unchanged; what changed is only *how many* `From` impls one enum needs.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 4. Benchmarking with Criterion
+
+A capstone claims "the hot loop is fast"; criterion is how the claim becomes a number with error bars. The desk's `benches/desk.rs`:
+
+```rust
+use criterion::{criterion_group, criterion_main, Criterion};
+use spike21::{price_fast, price_slow};
+
+fn bench_desk(c: &mut Criterion) {
+    let rows: Vec<i64> = (1..=200).collect();
+    let mut group = c.benchmark_group("desk");
+    group.throughput(criterion::Throughput::Elements(rows.len() as u64));
+    group.bench_function("slow", |b| b.iter(|| price_slow(std::hint::black_box(&rows))));
+    group.bench_function("fast", |b| b.iter(|| price_fast(std::hint::black_box(&rows))));
+    group.finish();
+}
+
+criterion_group!(benches, bench_desk);
+criterion_main!(benches);
+```
+
+`cargo bench` on this machine:
+
+```text
+desk/slow    time:   [146.61 ns 148.61 ns 151.31 ns]   thrpt: [1.32 Gelem/s ...]
+desk/fast    time:   [82.647 ns 83.181 ns 83.765 ns]    thrpt: [2.39 Gelem/s ...]
+```
+
+Reading the receipt, piece by piece:
+
+- **`[low est. point high]`** — a confidence interval, not a stopwatch number. Compare *distributions*: 83.2 ns ± noise beats 148.6 ns ± noise; 83.2 vs 85.0 might be nothing.
+- **`thrpt:`** — only appears because of `Throughput::Elements`: ns per element, so two sizes compare.
+- **`Found 9 outliers among 100`** — normal on a desktop OS; criterion's statistics already down-weighted them. Panic only when outliers ARE the measurement.
+- **`std::hint::black_box(&rows)`** — without it the optimizer deletes the work being timed; the input goes in opaque so the loop cannot be constant-folded away.
+- **`Gnuplot not found, using plotters backend`** — a report, not an error: the HTML report still lands in `target/criterion/report/index.html`.
+
+And the workflow receipts: `cargo bench -- slow` runs the name-filtered subset; **`cargo bench -- --save-baseline before`** stores a run, `cargo bench -- --baseline before` compares the next run against it — the regression gate in CI; **`cargo bench -- --test`** runs each bench ONCE as a plain test (printed `Testing desk/slow ... Success` on this machine) so CI can verify benches compile-and-run without paying the ~10 s sampling. The rule the desk demonstrates: **the benchmark's sibling test asserts correctness first** (`tests/equiv.rs`: `slow == fast`) — a fast wrong answer is still wrong.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 4.1 The claim, measured where the kernel CAN run it: same kernels, same
+// shape, Instant instead of criterion — then the receipts table from the
+// real run quoted in prose above.
+let rows: Vec<i64> = (1..=2_000).collect();
+
+// correctness gate first (tests/equiv.rs's job in the desk)
+assert_eq!(price_slow(&rows), price_fast(&rows));
+
+// the timing, with black_box's job done by a running sum the compiler
+// cannot fold away
+let t0 = std::time::Instant::now();
+let a = price_slow(&rows);
+let slow = t0.elapsed();
+let t1 = std::time::Instant::now();
+let b = price_fast(&rows);
+let fast = t1.elapsed();
+
+assert_eq!(a, b);
+assert!(fast <= slow, "the closed form should not lose to the loop");
+println!("slow = {:>8.1?}  fast = {:>8.1?}  (n = {} rows)",
+    slow, fast, rows.len());
+println!("criterion adds the statistics: confidence intervals, outliers,");
+println!("baselines. Instant here proves only the DIRECTION of the claim.");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+One read. **`Instant` proves the direction; criterion proves the magnitude**: the kernel's timer has no warmup, no outlier model, no confidence interval — and debug-build timings are indicative at best (§4 of the desk runs release-grade sampling under `cargo bench`, which builds with `--release`-level optimization for benches). The habit the mirror teaches is the *order*: correctness assert, then timing, then only claims the tool can support.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 5. Structuring a Small Multi-Module Service
+
+The capstone is *assembly*, which means the shape it assembles into is decided now, not mid-refactor. The working layout for a service of this size — one crate, **modules by responsibility, one `mod` tree deep**:
+
+```text
+market-data/
+  Cargo.toml
+  src/
+    lib.rs         the façade: pub use of the API + Service::run + shutdown
+    error.rs       ServiceError + the From impls (§3)
+    feed.rs        chapter 17's client behind a trait
+    cache.rs       chapter 18's pool behind a trait
+    store.rs       chapter 19's pool behind a trait
+    kernel.rs      the pricing math, pure functions, no I/O (§20 export shape)
+  benches/         criterion (§4)
+  tests/           integration tests per module
+```
+
+Four rules carry the weight:
+
+1. **The inventory rule: each module has one job.** If you cannot say what a module owns in one sentence, it is two modules. `error.rs` owns error conversion; `kernel.rs` owns arithmetic; nothing else does either.
+2. **Business logic never touches the boundary.** `kernel.rs` is pure — `fn price(&[Tick]) -> Vec<Quote>` — which is what makes it unit-testable without a server (ch20's export shape) and benchmarkable without fixtures (§4's black_box rows).
+3. **Dependencies point inward**: `feed/cache/store` depend on `error.rs` and their own clients; `lib.rs` depends on all of them; nothing depends on `lib.rs` except `main`/tests/benches. A cycle is the first symptom of a module with two jobs.
+4. **One façade owns shutdown.** Chapter 16's rule scaled up: runtimes and pools are parked in one place (`OnceLock`, §17.9) and closed in one place; a service with two owners of its tokio runtime has two code paths for "stop", and one of them hangs.
+
+Errors flow the same direction as dependencies — outward: module code returns `Result<_, ServiceError>`, the façade's `run` returns `Result<(), ServiceError>`, and `main` converts to exit codes (chapter 11's `main() -> Result` contract: stderr `Error: <Debug>`, exit 1).
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 5.1 The layout rules as kernel-honest shape: a one-pass inventory (the
+// module->job map, folded), inward-only dependencies, and a façade that
+// composes two "modules" behind one run() with one error exit.
+#[derive(Debug, PartialEq)]
+enum Job {
+    Pure,
+    Boundary,
+}
+
+// rule 1: one job per module, sayable in one word
+let inventory: std::collections::HashMap<&str, Job> = std::collections::HashMap::from([
+    ("kernel", Job::Pure),
+    ("feed", Job::Boundary),
+    ("cache", Job::Boundary),
+]);
+
+// rule 2: the pure module, testable with no server in sight
+fn price(qty: i64) -> i64 {
+    qty * 100
+}
+assert_eq!(price(3), 300);
+
+// rule 3: dependencies point inward — the boundary modules take the pure
+// one as a parameter; nothing here reaches back out
+struct FeedMod;
+impl FeedMod {
+    fn ticks(&self, base: i64) -> Vec<i64> {
+        vec![base, base + 1]
+    }
+}
+fn run(feed: &FeedMod) -> Result<Vec<i64>, String> {
+    Ok(feed.ticks(40).into_iter().map(price).collect())
+}
+
+// rule 4: ONE façade owns the lifecycle and the error exit
+match run(&FeedMod) {
+    Ok(quotes) => assert_eq!(quotes, vec![4000, 4100]),
+    Err(_) => unreachable!(),
+}
+// and a failing boundary propagates outward as the one error type
+fn run_bad(_feed: &FeedMod) -> Result<Vec<i64>, String> {
+    Err("feed: status 404".to_string())
+}
+assert_eq!(run_bad(&FeedMod), Err("feed: status 404".to_string()));
+println!("inventory: {} modules, each one job; deps inward; one facade, one exit",
+    inventory.len());
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+One read. **The mirror is the service in miniature**: an inventory that fits in one `HashMap` literal, a pure function the boundary modules call (never the reverse), and a façade whose `run` is the only thing main ever talks to. When chapter 22 builds the real thing, the only difference is that `Feed` stops being a stub — the shape, the dependency direction, and the single error exit are already proven here.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 6. Choosing the Capstone Scope
+
+Scope is the chapter's judgment call, and the checklist is subtraction. **The must-have core is fixed** — the market-data service chapter 22 guides: ingest a WebSocket feed (17), cache state in Redis (18), persist fills to PostgreSQL (19), expose results on the command line, async error handling and graceful shutdown throughout — *no new concepts, only assembly*. Everything else is evaluated against two questions: **does it exercise a chapter's skill, and does it fit the build budget?**
+
+Sorted honestly:
+
+- **In**: the §5 layout (this chapter's deliverable), §3's error enum, §4's bench on `kernel.rs`, integration tests per module, `--save-baseline` as the regression gate.
+- **Deferred without guilt**: distributed anything, TLS termination, authn/authz, config-file formats, metrics dashboards. Each is a real skill with a real crate — and none of them is the assignment.
+- **Already covered elsewhere**: logging/tracing is chapter 09's skill (the tracker note says exactly this — scope items move out when a chapter owns them; ch09 did).
+
+The readiness audit before writing code, section by section: WS reconnect loops (§17.11), cache-aside with TTL (§18.9), transactional persistence with bound parameters (§19.5–6), pool sizing and timeouts (§19.7), pyo3 export of `kernel.rs` if the Python host is in scope (§20.4). If any row of that audit cannot be answered from the named section, the prep work is *that section*, not new scope.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 7. Reading the Compiler: E-Codes
+
+The chapter's diagnostics are the multi-crate world's, quoted from §15–19's gates and the spike21 desk.
+
+| Diagnostic | The story it tells |
+|---|---|
+| **E0432 `failed to resolve: use of undeclared crate` (+ "maybe you need the feature")** | a method or module is behind a cargo feature you did not enable — the docs.rs *Feature flags* panel (§1) is the fix; this series hit it for reqwest's `stream`, sqlx's `macros`, redis's `tokio-comp`. |
+| **E0599 `no method named X found`** | often the same story at method level: the inherent method exists only with the feature on (chrono's `weekday` needed `Datelike` in scope, §15). Before suspecting your types, check the flag. |
+| **E0277 `the trait bound ... is not satisfied` in a bench | the bench crate is a separate build unit — types used in `benches/` must be `pub` in `lib.rs`; a private helper used in the bench is E0425/E0603, not a mystery. |
+| **`error: could not compile` at `cargo add`-then-build** | the feature inventory from `--dry-run` is the first read: a flag you enabled may pull an incompatible sibling (the ch19 wave's re-hash cascade is feature unification showing its teeth). |
+| **E0428/E0252 in the capstone** | the notebook rules generalize: one namespace per crate's module tree too — a `use` in each module for the names it uses, no glob-everything `use crate::prelude::*` that hides provenance. |
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 8. Mental Model: The Receipts
+
+| Claim | Receipt |
+|---|---|
+| Three artifacts before the manifest | §1: docs.rs flags, CHANGELOG, registry source path |
+| `CARGO_HOME` is a variable, not a law | §0: `C:\DEV\Rust\.cargo` on this machine |
+| Dry-run shows the whole flag surface | §2: `+ derive` / `- rc` inventory, then abort |
+| Features are the dependency budget | §2: derive pulls serde_derive + syn |
+| One domain error, `?` everywhere | §3.1: three crates, one signature, `feed: status 404` |
+| Display names the layer | §3.1: `cache: down`, §19's SQLSTATE discipline scaled up |
+| Correctness before timing | §4.1 + `tests/equiv.rs`: slow == fast asserted first |
+| criterion's interval beats Instant | §4 receipts: `[146.6 148.6 151.3]` vs `[82.6 83.2 83.8]` ns |
+| Baselines gate regressions | §4: `--save-baseline before` → `--baseline before` |
+| CI runs benches as tests | §4: `cargo bench -- --test` → `Testing desk/slow ... Success` |
+| One job per module, deps inward | §5.1: inventory map, pure kernel, façade `run` |
+| One façade owns shutdown | §5: chapter 16's parked-runtime rule, scaled to a service |
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 9. Cheat Sheet
+
+```text
+# ---- read before you add (§1) ----
+docs.rs feature flags panel          # what gates the method you want
+$CARGO_HOME/registry/src/<hash>/<crate>-<ver>/CHANGELOG.md   # what changed
+cargo tree --depth 1                 # the graph you are actually getting
+
+# ---- add with eyes open (§2) ----
+cargo add serde --dry-run            # version + full feature inventory, then abort
+cargo add serde --features derive    # flags named explicitly, defaults suspect
+Cargo.lock committed                 # pinned versions, reproducible benches
+
+# ---- one error story across crates (§3) ----
+enum ServiceError { Feed(..), Cache(..), Store(..) }
+impl From<reqwest::Error> for ServiceError { .. }   # once per boundary
+fn pipeline() -> Result<Q, ServiceError>            # ? everywhere else
+impl From<ServiceError> for PyErr                    # the LAST boundary (§20)
+
+# ---- measure, don't guess (§4) ----
+group.throughput(Throughput::Elements(n));
+b.iter(|| kernel(black_box(&rows)));
+cargo bench -- --save-baseline before     # tonight
+cargo bench -- --baseline before          # every PR
+cargo bench -- --test                     # CI: benches compile-and-run, ~seconds
+
+# ---- the service shape (§5) ----
+src/{lib,error,feed,cache,store,kernel}.rs
+# kernel is pure: fn price(&[Tick]) -> Vec<Quote>   no I/O, unit-testable
+# deps point inward; ONE facade owns runtime + shutdown; main converts to exit codes
+```
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 10. Review
+
+Twelve questions, in chapter order. Answers are in the prose above each.
+
+1. **(§0)** Why does this chapter stay std-only in the kernel, and where do criterion and `cargo add` actually run?
+2. **(§1)** Name the three artifacts read before a crate enters the manifest, and what each answers.
+3. **(§1)** Why is `$CARGO_HOME` quoted before writing a path into a README, and what is the default you should not assume?
+4. **(§2)** What does `cargo add --dry-run` print, and why is it the first command, not `cargo add`?
+5. **(§2)** What does `+ derive` vs `- rc` mean in the dry-run output, and what does enabling a feature potentially cost?
+6. **(§2)** What is feature unification, and which earlier chapter's gate felt it?
+7. **(§3)** Why convert at the boundary instead of formatting at ten call sites?
+8. **(§3)** What is the outermost boundary's dialect decision, and which chapter taught the payload rule?
+9. **(§4)** Why `black_box`, and what does criterion's `[low est high]` tell you that `Instant` cannot?
+10. **(§4)** What do `--save-baseline` and `-- --test` each buy in CI, and what must run BEFORE the timing claim?
+11. **(§5)** State the inventory rule, the dependency direction, and who owns shutdown.
+12. **(§6)** What are the two questions every scope item must answer, and what is the fixed core of chapter 22's service?
+
+### What Comes Next
+
+| Next | What it borrows from here |
+|---|---|
+| **22 — Capstone** | everything: §5's layout is the skeleton, §3's error enum the spine, §4's bench the regression gate, §1–2's reading discipline the maintenance plan. No new concepts — assembly. |
+
+Carry forward: **read the flags, pin the lock, convert at the boundary, measure with baselines, one job per module, one façade for shutdown.**
+</VSCode.Cell>

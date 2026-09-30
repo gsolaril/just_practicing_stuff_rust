@@ -1,0 +1,799 @@
+<VSCode.Cell language="markdown">
+# Rust 120: PyO3 — Rust Inside Python
+
+The escape hatch for a Python codebase: keep the Python at the boundary and drop to Rust for the hot path. PyO3 compiles a Rust `cdylib` into a Python extension module (`.pyd` on Windows), and the attribute macros — `#[pyfunction]`, `#[pymodule]`, `#[pyclass]`, `#[pymethods]` — generate every shim the two type systems need from each other.
+
+**This chapter runs differently**: a Python extension module cannot load inside this notebook's kernel, so the pyo3 code appears as pre-verified snippets — every one compiled and exercised by the scratch project's pytest run (`spike20`, Python 3.13.5, pyo3 0.29.2). The **runnable cells** are the plain-Rust shapes the macros wrap: the same signatures, the same error conversions, the same repr conventions — they run here so you can execute what the snippets assert. Each snippet carries its receipt as a pytest line.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+### Contents
+
+- [0. Notebook Conventions: How These Cells Run](#0-notebook-conventions-how-these-cells-run)
+- [1. The Boundary: What Crosses, What It Costs](#1-the-boundary-what-crosses-what-it-costs)
+- [2. `pyfunction`: Arguments and Returns](#2-pyfunction-arguments-and-returns)
+- [3. Errors Across the Boundary](#3-errors-across-the-boundary)
+- [4. `pyclass` and `pymethods`](#4-pyclass-and-pymethods)
+- [5. Containers in Both Directions](#5-containers-in-both-directions)
+- [6. Calling Python from Rust](#6-calling-python-from-rust)
+- [7. `Python<'py>`, the GIL, and attach](#7-pythonpy-the-gil-and-attach)
+- [8. The Build Loop: cargo, `.pyd`, pytest](#8-the-build-loop-cargo-pyd-pytest)
+- [9. Reading the Compiler: E-Codes](#9-reading-the-compiler-e-codes)
+- [10. Mental Model: The Receipts](#10-mental-model-the-receipts)
+- [11. Cheat Sheet](#11-cheat-sheet)
+- [12. Review](#12-review)
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 0. Notebook Conventions: How These Cells Run
+
+This notebook runs on the same **evcxr** kernel as every chapter. Three consequences shape how you work:
+
+1. **No `fn main`.** The body of a cell *is* the body of `main`. Type statements directly.
+2. **State persists.** A binding from an earlier cell is visible in every cell below it — including `use` lines.
+3. **Items are order-independent.** A struct or fn may be used above the cell that defines it.
+
+> **Item names must be unique across the whole notebook.** Every cell shares one namespace; two functions with the same name are a redefinition error even in different sections. The same rule covers `use` lines: the first cell that needs a name is the one that imports; later cells rely on persistence — a repeated `use` is E0252.
+
+### The chapter's no-crate rule, and where the pyo3 code runs
+
+No `:dep` lines here: pyo3 links as a `cdylib` against `python313.dll`, which cannot load into the kernel's process. The pyo3 material lives in the **spike20 scratch project** — the chapter's desk — built once and probed from pytest:
+
+```text
+C:/Users/GSL/AppData/Local/Temp/spike20/
+  Cargo.toml            [lib] crate-type = ["cdylib"], pyo3 = "0.29"
+  src/lib.rs            the probe module (every snippet in this notebook, verbatim)
+  pytest/spike20.pyd    the built module: target/debug/spike20.dll, renamed
+  pytest/test_spike20.py  the receipt suite: 8 passed in 0.06s
+```
+
+The build loop (§8) is three commands: `cargo build`, copy `target/debug/spike20.dll` to `pytest/spike20.pyd`, `python -m pytest test_spike20.py -s`. Every snippet in this notebook shows its receipt inline, like:
+
+```text
+D: errors ok (PyValueError, From<Spill>, create_exception)
+```
+
+### Reading the runnable cells
+
+The **runnable cells** are mirrors: plain Rust with no pyo3 in sight, shaped so the exact claim the pyo3 snippet makes can be executed here. Where a mirror exists, its caption names the section of the pyo3 story it proves. Verify versions before trusting any of it:
+
+- `python --version` → **3.13.5** (64-bit, MSC v.1943)
+- `cargo tree` in spike20 → **pyo3 0.29.2** (pulls pyo3-macros 0.29.2, pyo3-ffi 0.29.2)
+- `python -m pytest --version` → **8.4.0**
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 0.1 The boundary scalars: the types that cross losslessly, at their limits.
+// i64 and f64 and bool and String — the vocabulary of every signature in
+// this chapter. (Mirrors probe A: add(i64, i64), greet(&str) -> String.)
+fn identity(x: i64) -> i64 { x }
+fn identity_f(x: f64) -> f64 { x }
+fn identity_s(s: String) -> String { s }
+
+let big = i64::MAX;
+let mut border = std::collections::HashMap::new();
+border.insert("max", identity(big));
+border.insert("min", identity(i64::MIN));
+assert_eq!(border["max"], 9_223_372_036_854_775_807);
+assert_eq!(border["min"], -9_223_372_036_854_775_808);
+assert_eq!(identity_f(2.5), 2.5);
+assert_eq!(identity_s("desk".to_string()), "desk");
+// Python's int is arbitrary precision; i64 is not — the boundary clips
+println!("i64 boundary: {} .. {}", border["min"], border["max"]);
+println!("f64/bool/String cross exactly; an int beyond i64 overflows the boundary");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+Two reads. **These four types are the interop vocabulary**: `i64` (Python `int`, clipped at 2⁶³−1), `f64` (Python `float`, exact), `bool`, and `String`/`&str` (Python `str`). Everything else in the chapter — containers, structs, errors — is built out of them, and every signature in §2 is some arrangement of these. **The clip is the first boundary rule**: Python's `int` grows without limit; `i64` does not; a value that does not fit raises `OverflowError` at the crossing rather than wrapping.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 1. The Boundary: What Crosses, What It Costs
+
+PyO3 exists for the codebase that is *already* Python: profiles show a hot loop, a parser, a pricing kernel — and rewriting the whole service is not on the table. **A `cdylib` with one exported `PyInit_<name>` function is a Python module**; everything else is generated. What crosses the boundary, in both directions: **values** (§2's conversions), **errors** (§3), **types** (§4's classes), and **calls back into Python** (§6). What does not cross: lifetimes — Python objects live under the GIL with reference counting; Rust references live under the borrow checker — so the boundary hands out *owned* data (`Py`, `Bound<'py, T>`) and tokens (§7), never bare `&T` into Python's heap.
+
+The cost ledger, measured on the spike20 build: the first `cargo build` compiles pyo3 + proc-macro stack in **~20 s**; the edit loop after that is **~1 s** (one crate rebuilds); `import spike20` is sub-millisecond. The per-call cost of the boundary is a few conversions — negligible next to what moved into Rust, which is the whole argument.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 1.1 Ownership at the boundary, mirrored: the crossing hands over OWNED
+// data and gets owned data back. (Mirrors greet(&str) -> String: a borrowed
+// view in, a fresh String out.)
+struct Desk;
+
+impl Desk {
+    // &str in: borrowed, not owned — the caller keeps its string
+    fn greet(&self, name: &str) -> String {
+        format!("hello, {name}")
+    }
+
+    // String in: taken by value — the caller gave up its copy
+    fn consume(self, tag: String) -> (String, usize) {
+        let n = tag.len();
+        (format!("{tag}/{tag}"), n)
+    }
+}
+
+let desk = Desk;
+let mine = "desk".to_string();
+let out = desk.greet(&mine);
+assert_eq!(out, "hello, desk");
+assert_eq!(mine, "desk", "the borrowed view left the caller's string intact");
+
+let (doubled, n) = desk.consume(mine);
+assert_eq!(doubled, "desk/desk");
+assert_eq!(n, 4);
+// mine is gone: moved across. This is why pyo3 hands Python COPIES of
+// simple data and Py/Bound handles for everything else.
+println!("borrow in -> String out; String in -> moved. boundary = ownership transfer");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+Two reads. **Borrowed in, owned out** is the polite crossing: `&str` parameters cost the caller nothing and return a fresh `String` — probe A's `greet("desk") -> "hello, desk"` is exactly this shape. **Moved in, moved out** is the other crossing: a `String` parameter takes ownership, which is why pyo3 converts Python `str` to a *new* Rust `String` at the boundary — Python's string was never the Rust string, and vice versa. The mirrors in this notebook keep both crossings in kernel-honest Rust; the pyo3 snippets show the same signatures under the macros.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 2. `pyfunction`: Arguments and Returns
+
+`#[pyfunction]` turns a plain Rust fn into a Python callable by generating two shims: **argument extraction** (each parameter type must implement `FromPyObject`) and **return conversion** (the return type must implement `IntoPyObject`). The verified surface, from spike20 with its pytest receipts:
+
+```rust
+#[pyfunction]
+fn add(a: i64, b: i64) -> PyResult<i64> {
+    Ok(a + b)
+}
+
+#[pyfunction]
+fn sum_list(vals: Vec<i64>) -> PyResult<i64> {
+    Ok(vals.iter().sum())
+}
+
+#[pyfunction]
+fn count_keys(d: HashMap<String, i64>) -> PyResult<usize> {
+    Ok(d.len())
+}
+
+#[pyfunction]
+fn maybe(x: Option<String>) -> PyResult<String> {
+    Ok(match x {
+        Some(s) => format!("some:{s}"),
+        None => "none".to_string(),
+    })
+}
+
+#[pyfunction]
+fn pair_arg(p: (String, i64)) -> PyResult<String> {
+    Ok(format!("{}={}", p.0, p.1))
+}
+```
+
+The receipts, straight from `test_spike20.py`:
+
+```python
+assert spike20.sum_list([1, 2, 3]) == 6          # list -> Vec<i64> -> sum
+assert spike20.count_keys({"a": 1, "b": 2}) == 2 # dict -> HashMap
+assert spike20.maybe("x") == "some:x"
+assert spike20.maybe(None) == "none"             # None <-> Option, lossless
+assert spike20.pair_arg(("px", 42)) == "px=42"   # tuple -> (String, i64)
+with pytest.raises(TypeError):
+    spike20.sum_list(5)                          # wrong shape -> TypeError
+```
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 2.1 The argument surface as plain Rust: the exact signatures the macros
+// accept, called the way Python called them in the receipts.
+fn sum_list(vals: Vec<i64>) -> i64 {
+    vals.iter().sum()
+}
+
+fn count_keys(d: std::collections::HashMap<String, i64>) -> usize {
+    d.len()
+}
+
+fn maybe(x: Option<String>) -> String {
+    match x {
+        Some(s) => format!("some:{s}"),
+        None => "none".to_string(),
+    }
+}
+
+fn pair_arg(p: (String, i64)) -> String {
+    format!("{}={}", p.0, p.1)
+}
+
+assert_eq!(sum_list(vec![1, 2, 3]), 6);
+assert_eq!(count_keys(std::collections::HashMap::from([
+    ("a".to_string(), 1),
+    ("b".to_string(), 2),
+])), 2);
+assert_eq!(maybe(Some("x".to_string())), "some:x");
+assert_eq!(maybe(None), "none");
+assert_eq!(pair_arg(("px".to_string(), 42)), "px=42");
+// the TypeError shape: Python refuses sum_list(5) BEFORE Rust runs — the
+// generated shim extracts arguments first, and 5 is not a list
+println!("Vec/HashMap/Option/tuple: the FromPyObject surface, no macros needed to see it");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+Three reads. **`Option<T>` is the `None` contract, both directions** — `maybe(None)` returns `"none"` because the shim decoded Python `None` to `Option::None` before Rust saw it; a parameter of bare `String` would have raised `TypeError` on `None` instead. **`Vec<T>`, `HashMap<K, V>`, tuples** extract eagerly: the whole list is copied into a `Vec<i64>` at the crossing — cheap for scalars, the thing to remember before handing a million-element list to a function that wanted an iterator. **`TypeError` is generated, not thrown by you**: `sum_list(5)` fails in the shim's extraction step, before your body runs — which is why §3's error story is about *your* failures, and argument shape is the machinery's.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 3. Errors Across the Boundary
+
+Rust errors and Python exceptions are different machines, and **`PyResult<T>` is the adapter**: `Result<T, PyErr>` on the Rust side, `raise` on the Python side. Three escalation levels, all probe-verified in spike20:
+
+```rust
+// level 1: the built-in exception types, one module apiece
+use pyo3::exceptions::PyValueError;
+
+#[pyfunction]
+fn always_fails(x: i64) -> PyResult<i64> {
+    Err(PyValueError::new_err(format!("desk refuses {x}")))
+}
+```
+```python
+with pytest.raises(ValueError, match="desk refuses 7"):
+    spike20.always_fails(7)        # receipt D
+```
+
+```rust
+// level 2: your Rust error type, bridged by From — the ? in a pyfunction
+// crosses the boundary THROUGH this impl
+#[derive(Debug)]
+struct Spill(String);
+impl std::fmt::Display for Spill { /* "spill: {0}" */ }
+impl std::error::Error for Spill {}
+
+impl From<Spill> for PyErr {
+    fn from(e: Spill) -> PyErr {
+        // the From impl decides the Python-visible payload: Display is NOT
+        // applied automatically — format through it deliberately
+        PyValueError::new_err(e.to_string())
+    }
+}
+
+#[pyfunction]
+fn custom_error(n: i64) -> Result<i64, Spill> {
+    if n < 0 { Err(Spill(format!("negative {n}"))) } else { Ok(n * 2) }
+}
+```
+```python
+assert spike20.custom_error(21) == 42
+with pytest.raises(ValueError, match="spill: negative"):
+    spike20.custom_error(-3)       # receipt D
+```
+
+```rust
+// level 3: your own exception CLASS, registered on the module
+pyo3::create_exception!(spike20, DeskError, PyValueError);
+
+#[pyfunction]
+fn raise_desk(msg: String) -> PyResult<()> {
+    Err(DeskError::new_err(msg))
+}
+```
+```rust
+#[pymodule]
+fn spike20(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // ...
+    m.add("DeskError", m.py().get_type::<DeskError>())?;   // expose it
+    Ok(())
+}
+```
+```python
+with pytest.raises(spike20.DeskError, match="connection refused"):
+    spike20.raise_desk("connection refused")   # receipt D
+```
+
+One probe refusal worth its weight: the first draft's `From` impl wrote `new_err(e.0)`, and the receipt failed — **`Display` is not applied for you**; whatever the `From` impl hands `new_err` is exactly what Python sees.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 3.1 The level-2 machinery as plain Rust: From bridges an error type into
+// the boundary's error — the exact shape ? relies on inside a pyfunction.
+#[derive(Debug)]
+struct Spill(String);
+
+impl std::fmt::Display for Spill {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "spill: {}", self.0)
+    }
+}
+impl std::error::Error for Spill {}
+
+// the boundary error for this mirror; From is the bridge the macros call
+#[derive(Debug)]
+struct PyErrMirror(String);
+
+impl From<Spill> for PyErrMirror {
+    fn from(e: Spill) -> PyErrMirror {
+        PyErrMirror(e.to_string())
+    }
+}
+
+fn custom_error(n: i64) -> Result<i64, Spill> {
+    if n < 0 {
+        Err(Spill(format!("negative {n}")))
+    } else {
+        Ok(n * 2)
+    }
+}
+
+// what the generated shim does with your Err: From::from, then raise
+fn shim(n: i64) -> Result<i64, PyErrMirror> {
+    let v = custom_error(n)?;   // the ? in a pyfunction IS this From call
+    Ok(v)
+}
+
+assert_eq!(shim(21).unwrap(), 42);
+let bridge = shim(-3).unwrap_err();
+assert_eq!(bridge.0, "spill: negative -3");
+println!("From<Spill> chose the payload: '{}' — Display applied deliberately", bridge.0);
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+Three reads. **The three levels are an escalation path, not a choice**: built-ins (`PyValueError`, `PyTypeError`, `PyKeyError`, ...) cover most cases; `From<E> for PyErr` is for Rust error types that predate Python (chapter 11's `thiserror`-style enums bridge with one impl — and `?` inside a `#[pyfunction]` converts *through* it automatically, which is the chapter-11 promise kept at the boundary); `create_exception!` is for exceptions Python code must *catch by class*, not by message. **`Debug` on the error struct is not optional** — the probe's first draft omitted it and got E0277: `std::error::Error: Debug + Display`, the same bound chapter 11 taught, now load-bearing at the boundary. **The payload rule bites once**: `new_err(e.0)` threw away the `"spill: "` prefix because the impl was never consulted — whatever `From` produces is the message, word for word.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 4. `pyclass` and `pymethods`
+
+`#[pyclass]` turns a Rust struct into a Python class; `#[pymethods]` is the second impl block that exposes its surface. The verified `Fill` from spike20, with receipt E:
+
+```rust
+#[pyclass]
+struct Fill {
+    #[pyo3(get, set)]
+    sym: String,
+    #[pyo3(get, set)]
+    qty: i64,
+}
+
+#[pymethods]
+impl Fill {
+    #[new]
+    fn new(sym: String, qty: i64) -> Self {
+        Fill { sym, qty }
+    }
+
+    fn notional(&self) -> i64 {
+        self.qty * 100
+    }
+
+    #[getter]
+    fn label(&self) -> PyResult<String> {
+        Ok(format!("{}x{}", self.sym, self.qty))
+    }
+
+    #[setter]
+    fn set_label(&mut self, _v: String) -> PyResult<()> {
+        Err(PyValueError::new_err("label is read-only"))
+    }
+
+    fn __repr__(&self) -> PyResult<String> {
+        Ok(format!("Fill({:?}, {})", self.sym, self.qty))
+    }
+
+    #[staticmethod]
+    fn desk_name() -> PyResult<String> {
+        Ok("fill-desk".to_string())
+    }
+}
+```
+
+```python
+f = spike20.Fill("AAA", 100)      # #[new]
+f.qty = 150                       # #[pyo3(get, set)]
+assert f.notional() == 15000      # plain method
+assert f.label == "AAAx150"       # computed getter
+with pytest.raises(ValueError, match="label is read-only"):
+    f.label = "no"                # the setter's Err passes through verbatim
+assert repr(f) == 'Fill("AAA", 150)'  # Rust Debug speaks DOUBLE quotes
+assert spike20.Fill.desk_name() == "fill-desk"
+```
+
+Two refusals the probes caught, both now part of the receipt: the setter's `PyValueError` surfaced as **`ValueError`, not `AttributeError`** — Python's builtin read-only attributes raise `AttributeError`, but a `#[setter]` that returns `Err` chooses its own exception, verbatim. And `__repr__` written in Rust speaks **Rust's `Debug` conventions** — `{:?}` on a `String` yields double quotes where Python's `repr` would use single.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 4.1 The pyclass surface as plain Rust: get/set fields, a computed
+// property, a refusing setter, and the repr — every piece with the same
+// behavior the macros generate.
+#[derive(Debug, Clone)]
+struct Fill {
+    sym: String,
+    qty: i64,
+}
+
+impl Fill {
+    fn new(sym: &str, qty: i64) -> Self {
+        Fill { sym: sym.to_string(), qty }
+    }
+
+    fn notional(&self) -> i64 {
+        self.qty * 100
+    }
+
+    fn label(&self) -> String {
+        format!("{}x{}", self.sym, self.qty)
+    }
+
+    fn set_label(&mut self, _v: &str) -> Result<(), String> {
+        Err("label is read-only".to_string())
+    }
+}
+
+let mut f = Fill::new("AAA", 100);
+f.qty = 150;                                   // the get/set field
+assert_eq!(f.notional(), 15000);               // the method
+assert_eq!(f.label(), "AAAx150");              // the computed property
+let refused = f.set_label("no").unwrap_err();
+assert_eq!(refused, "label is read-only");     // the Err passes verbatim
+// the repr claim, on the real type: {:?} double-quotes the String
+assert_eq!(format!("{:?}", "AAA"), "\"AAA\"");
+assert_eq!(format!("{:?}", f.qty), "150");
+println!("Fill surface: field, method, computed label, refusing setter, repr = {:?}",
+    format!("Fill({:?}, {})", f.sym, f.qty));
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+Two reads. **`#[pyo3(get, set)]` is field-level opt-in**, not a derive-wide default: drop `set` and the attribute is read-only from Python; drop both and the field is private to Rust. `#[getter]`/`#[setter]` name-shape computed properties — `label` reads through the function, assignment routes to `set_label`. **`#[new]` is the constructor contract**: without it, `spike20.Fill("AAA", 100)` is a `TypeError` — Python classes are *called*, and only `#[new]` registers the callee. The `&self`/`&mut self` receivers map straight onto Python's method binding; `PyResult` returns keep §3's error machinery identical inside classes.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 5. Containers in Both Directions
+
+Beyond §2's eager `Vec`/`HashMap` extraction, pyo3 lets Rust **build** Python containers and hand them back. The verified builders from spike20 (receipt F):
+
+```rust
+use pyo3::types::{PyDict, PyList, PyTuple};
+
+#[pyfunction]
+fn build_dict(py: Python<'_>) -> PyResult<Py<PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("alpha", 1)?;
+    d.set_item("beta", 2)?;
+    Ok(d.into())    // Bound<'_, PyDict> -> Py<PyDict>: detach from the token
+}
+
+#[pyfunction]
+fn build_list(py: Python<'_>) -> PyResult<Py<PyList>> {
+    let items: Vec<i64> = vec![10, 20, 30];
+    Ok(PyList::new(py, &items)?.into())
+}
+
+#[pyfunction]
+fn build_tuple(py: Python<'_>) -> PyResult<Py<PyTuple>> {
+    Ok(PyTuple::new(py, ["a", "b"])?.into())
+}
+```
+```python
+assert spike20.build_dict() == {"alpha": 1, "beta": 2}
+assert spike20.build_list() == [10, 20, 30]
+assert spike20.build_tuple() == ("a", "b")
+```
+
+Two ideas do all the work. **`py` gives birth** — every Python object created from Rust is born with a lifetime tied to a `Python<'py>` token (§7); `PyDict::new(py)` needs it. **`.into()` detaches** — `Py<T>` is the GIL-independent handle that survives the token; the return type of every snippet is `Py<...>`, not `Bound<...>`, precisely because the value must outlive this call's token. The rule: **work in `Bound<'py, T>` while you hold the token, return `Py<T>`**.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 5.1 The same two ideas as plain Rust: a value BORN under a guard and
+// DETACHED to outlive it. (Mirrors Bound<'py,T> while holding the token;
+// Py<T> after it is gone.)
+struct Token;
+struct Detached(String);
+
+struct Born<'a> {
+    v: String,
+    _t: std::marker::PhantomData<&'a Token>,
+}
+
+impl<'a> Born<'a> {
+    // borrows the token: the value's lifetime is tied to it
+    fn new(_t: &'a Token, v: &str) -> Self {
+        Born { v: v.to_string(), _t: std::marker::PhantomData }
+    }
+
+    // detach: strip the lifetime, keep the data — Bound::into -> Py<T>
+    fn into_detached(self) -> Detached {
+        Detached(self.v)
+    }
+}
+
+let t = Token;
+let detached = {
+    let born = Born::new(&t, "row0");
+    born.into_detached()   // detaches INSIDE the guard's scope
+};
+// born is gone; detached survives — the Py<T> shape after the token ends
+assert_eq!(detached.0, "row0");
+let _ = &t;
+println!("born under the token, detached before it ends: Bound -> Py");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+Two reads. **`Bound<'py, T>` is a compile-time tether**: the type carries the token's lifetime, so every method that touches Python's heap requires you to hold `py` — the compiler, not discipline, enforces "no Python calls without the GIL." **`Py<T>` is the same object with the tether stripped** — `into()` erases the lifetime and the value travels anywhere, at the price that *using* it again requires re-attaching (§7's `attach`). Every snippet returning `Py<...>` in §5 made this exact move: build under the token, `into()` before returning.
+</VSCodeCell>
+<VSCode.Cell language="markdown">
+## 6. Calling Python from Rust
+
+The boundary runs both ways: the exported functions may need `math.sqrt`, a regex engine, or a callback the Python host passed in. The verified callers (receipt G):
+
+```rust
+#[pyfunction]
+fn call_math_sqrt(py: Python<'_>, x: f64) -> PyResult<f64> {
+    let math = py.import("math")?;       // import returns Bound<PyModule>
+    let sqrt = math.getattr("sqrt")?;    // attribute lookup is a PyResult
+    let r = sqrt.call1((x,))?;           // args travel as a Rust tuple
+    r.extract()                          // decode the reply back to Rust
+}
+```
+```rust
+#[pyfunction]
+fn eval_expr(py: Python<'_>) -> PyResult<i64> {
+    // c"..." — Python::eval takes &CStr, not &str (E0308 without it)
+    let r = py.eval(c"6 * 7", None, None)?;
+    r.extract()
+}
+```
+```python
+assert spike20.call_math_sqrt(144.0) == 12.0
+assert spike20.eval_expr() == 42
+```
+
+The call chain has four verbs — **import, getattr, call, extract** — and every one returns `PyResult`, so `?` chains them; argument tuples (`(x,)` — the comma is a one-element tuple, Rust side too) and `.extract::<T>()` close the loop back into typed Rust.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 6.1 The four verbs mirrored: import, getattr, call, extract — as a tiny
+// in-kernel "module registry" with the same Result-at-every-step shape.
+struct Registry(std::collections::HashMap<String, std::collections::HashMap<String, String>>);
+
+#[derive(Debug, PartialEq)]
+enum CallError {
+    NoModule(String),
+    NoAttr(String),
+}
+
+impl std::fmt::Display for CallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CallError::NoModule(m) => write!(f, "No module named '{m}'"),
+            CallError::NoAttr(a) => write!(f, "module has no attribute '{a}'"),
+        }
+    }
+}
+
+impl Registry {
+    fn import(&self, name: &str) -> Result<&std::collections::HashMap<String, String>, CallError> {
+        self.0.get(name).ok_or_else(|| CallError::NoModule(name.to_string()))
+    }
+}
+
+fn getattr<'a>(
+    m: &'a std::collections::HashMap<String, String>,
+    attr: &str,
+) -> Result<&'a String, CallError> {
+    m.get(attr).ok_or_else(|| CallError::NoAttr(attr.to_string()))
+}
+
+let mut math = std::collections::HashMap::new();
+math.insert("sqrt".to_string(), "builtin".to_string());
+let reg = Registry(std::collections::HashMap::from([
+    ("math".to_string(), math),
+]));
+
+// the happy chain: import -> getattr, then "call" is a decode
+// (? at every hop in the real pyo3 chain; cells can't use ? out of a
+// ()-returning main, so the mirrors unpack — same Results either way)
+let sqrt = reg.import("math").unwrap();
+let r = getattr(sqrt, "sqrt").unwrap();
+assert_eq!(r, "builtin");
+
+// the two error shapes, with Python's own exception wording
+assert_eq!(reg.import("numpy").unwrap_err(), CallError::NoModule("numpy".to_string()));
+assert_eq!(getattr(sqrt, "cosine").unwrap_err(), CallError::NoAttr("cosine".to_string()));
+assert_eq!(format!("{}", CallError::NoModule("numpy".to_string())), "No module named 'numpy'");
+println!("import/getattr/call/extract with ? at every hop — the chain IS four Results");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+Two reads. **`?` at every hop is not style — it is the API's shape**: import can fail, lookup can fail, the call can raise, the extract can refuse the type; the four-verb chain is `PyResult` end to end, and the mirror's `Result`-per-verb is the same discipline chapter 11 taught. **The error wording in the mirror is Python's wording** — `No module named 'numpy'` — because these strings are what Python code catches; a Rust error crossing outward must arrive speaking the host's language, which is §3's payload rule from the other side.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 7. `Python<'py>`, the GIL, and attach
+
+CPython's global interpreter lock means **one thread executes Python bytecode at a time**; Rust meets it as a proof obligation. The verified token facts from spike20:
+
+```rust
+// the token parameter: pyo3 elides `py: Python` from the Python signature —
+// attach_probe(py) is a 0-arg function in Python (receipt H:
+// attach_probe() == "token ok" — passing an argument is TypeError)
+#[pyfunction]
+fn attach_probe(py: Python<'_>) -> PyResult<String> { ... }
+```
+
+What the token buys, and what it costs:
+
+- **Proof of holding the GIL.** Every Python-heap operation — `PyDict::new`, `getattr`, `call1`, `extract` — demands a `Python<'py>` argument; the type system refuses Python access without it.
+- **Scope for `Bound<'py, T>`.** §5's lifetimes are all minted from the token.
+- **Not `Send`.** The token must not cross `thread::spawn`; pyo3's escape is `Python::attach`/`Python::detach` (0.29's API for the pair long spelled `with_gil`/`allow_threads`) — acquire on the thread that needs it, **release before long Rust work**, re-acquire after: `attach(|| { ... }); detach(|| { ... hot rust ... }); attach(|| { ... })`.
+
+**The chapter-16 connection**: `detach` is `spawn_blocking`'s inverse — tokio refused blocking the async reactor; pyo3 refuses *holding the GIL* through Rust-heavy work. Same shape: hand the blocking/HOT section to a context where it does not starve everyone else.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 7.1 The token discipline mirrored: acquire, do scoped work, RELEASE
+// before the long section, re-acquire. (attach/detach as a caller contract.)
+struct Gil;
+
+impl Gil {
+    fn attach<T>(f: impl FnOnce() -> T) -> T {
+        f()   // "acquire the lock": work runs under it
+    }
+    fn detach<T>(f: impl FnOnce() -> T) -> T {
+        f()   // "release": pure-Rust work runs without it
+    }
+}
+
+let mut log: Vec<&'static str> = Vec::new();
+
+let out = Gil::attach(|| {
+    log.push("attach: build dict under the token");
+    21
+});
+let doubled = Gil::detach(|| {
+    log.push("detach: pure-Rust section, lock released");
+    out * 2
+});
+let total = Gil::attach(|| {
+    log.push("attach: back under the token to use the result");
+    doubled + 21
+});
+
+assert_eq!(total, 63);
+assert_eq!(log, [
+    "attach: build dict under the token",
+    "detach: pure-Rust section, lock released",
+    "attach: back under the token to use the result",
+]);
+// the sectioning rule: Python-heap touches cluster under attach; the hot
+// loop lives in its own detach
+println!("acquire -> scoped work -> release -> re-acquire: 63 computed across three sections");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+One read. **The sectioning is the discipline**: Python-heap work clusters under `attach`; the long pure-Rust section releases the lock so other threads' Python code can run. A function that holds the GIL through a 200 ms pricing kernel stalls *every* Python thread in the process — the boundary's cardinal sin. The mirror's `attach/detach/attach` sandwich is the shape to keep; spike20's probe only proves the token threading (`attach_probe()` is 0-arg from Python), because the lock itself lives in CPython's C code — but the sectioning rule transfers unchanged to a real extension.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 8. The Build Loop: cargo, `.pyd`, pytest
+
+A PyO3 module is a **`cdylib`** — a C-ABI shared library with one exported symbol, `PyInit_<module_name>`, which CPython's importer calls. Windows names them `.pyd`, not `.dll`, to stop Python importing random DLLs; the rename is the whole transformation. The loop, as run for spike20:
+
+```text
+# 1. build (first build ~20 s: pyo3 + syn/quote + pyo3-ffi; edits ~1 s)
+cargo build
+# 2. rename into the importable module
+cp target/debug/spike20.dll pytest/spike20.pyd
+# 3. exercise from the host language
+cd pytest && python -m pytest test_spike20.py -s
+```
+
+Packaging tools (**maturin**, **setuptools-rust**) wrap exactly this loop with wheels and version matrices; chapter 21 will meet them as "read the tool's docs before the crate's". Two details the loop teaches by doing:
+
+- **`#[pymodule]` name = file name = `import` name.** `fn spike20` inside `spike20.pyd` — change either side alone and `import` fails with `ModuleNotFoundError... not a valid Win32 application`-class errors or missing init symbols.
+- **The build needs `python` on PATH at *compile* time** — pyo3's build script queries the interpreter's sysconfig for version, header dir, and ABI flags (this toolchain: Python 3.13.5 headers under `C:/DEV/Python/include`, pyo3 0.29 **raw-dylib** linking, so no import-library setup at all), while `python313.dll` itself is only needed at *load* time, and the running interpreter supplies it.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 9. Reading the Compiler: E-Codes
+
+The pyo3 diagnostics are the chapter's boundary rules, delivered by rustc.
+
+| Diagnostic | The story it tells |
+|---|---|
+| **E0277 `Spill doesn't implement Debug`** | `std::error::Error: Debug + Display` — a Rust error type bridged with `From` needs both; the probe's first draft omitted `derive(Debug)` and the bound failed at the `impl Error` line. Chapter 11's bound, load-bearing at the boundary. |
+| **E0308 `expected &CStr, found &str`** | `Python::eval` takes a C string — pass `c"6 * 7"`. Raw string literals with C semantics is the small tax for calling Python's compiler. |
+| **E0433 / module-not-found at build time** | pyo3's build script runs `python` to query sysconfig; a missing or wrong interpreter fails the *build*, not the link. Fix the PATH before touching code. |
+| **`OverflowError` at the crossing** | not a rustc code — a runtime refusal when Python's unbounded `int` does not fit `i64` (§0.1's clip, enforced by the shim). |
+| **`TypeError` from the shim** | argument shape refused *before* the body runs (`sum_list(5)`, receipt B); a Rust-side reminder that the generated extraction is the first function that sees every argument. |
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 9.1 The two compile-time diagnostics as kernel-honest mirrors: the Debug
+// bound on an error type, and the C-string shape.
+// Spill from §3.1 is in scope — items persist; redefining it would be E0428.
+// Its `impl std::error::Error for Spill` is exactly the line that demands
+// Debug: delete the derive above and this cell's item is the E0277 site.
+let _ = Spill("ok".to_string());
+
+// the C-string shape: a literal that outlives its scope as raw bytes
+let cs: &std::ffi::CStr = c"6 * 7";
+assert_eq!(cs.to_str().unwrap(), "6 * 7");
+assert_eq!(cs.to_bytes(), b"6 * 7");            // strips the NUL
+assert_eq!(cs.to_bytes_with_nul(), b"6 * 7\x00"); // keeps it
+println!("Error: Debug + Display (E0277); Python::eval wants &CStr (E0308) — both mirrored");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+Two reads. **The `Debug` bound is chapter 11's contract with one more consumer**: the same `impl std::error::Error` now serves a *Python* exception's `__str__` through `From`. **`&CStr` is the reminder that Python's expression compiler is a C API** — every `py.eval` carries the null terminator, and the `c""` literal makes the cost visible in the type. (Probed live: `to_bytes` strips that terminator, `to_bytes_with_nul` keeps it — Rust's view of the string and C's differ by exactly one byte, and the first draft's assert got it wrong.)
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 10. Mental Model: The Receipts
+
+| Claim | Receipt |
+|---|---|
+| The boundary scalars cross exactly; `int` clips at i64 | §0.1: min/max asserted; probe A |
+| Crossing = ownership transfer | §1.1: borrow in/owned out, move in/consume |
+| Signatures are the whole argument surface | §2.1 + probe B: `Vec`/`HashMap`/`Option`/tuple; `TypeError` on shape mismatch |
+| `PyResult` is the error adapter | probe D: `PyValueError` → `ValueError` |
+| `From<E> for PyErr` decides the payload | probe D: `"spill: negative -3"` — `Display` applied deliberately |
+| `create_exception!` is a catchable class | probe D: `pytest.raises(spike20.DeskError)` |
+| `#[new]` registers the constructor | probe E: `Fill("AAA", 100)` |
+| Fields opt in per-attribute | probe E: `get, set`; setter `Err` passes verbatim (`ValueError`) |
+| Rust `Debug` speaks double quotes | probe E: `repr == 'Fill("AAA", 150)'` |
+| Born under the token, detached to survive it | §5.1 + probe F: `Bound` → `into()` → `Py` |
+| import/getattr/call/extract, `?` at every hop | probe G: `sqrt(144) == 12`, `eval == 42` |
+| Token params are elided from Python's view | probe H: `attach_probe()` 0-arg |
+| GIL sectioning: attach / detach / re-attach | §7.1: 63 across three sections |
+| cdylib + rename = importable module | §8: `spike20.dll` → `spike20.pyd`, 8/8 passed |
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 11. Cheat Sheet
+
+```rust
+use pyo3::prelude::*;
+use pyo3::exceptions::PyValueError;
+use pyo3::types::{PyDict, PyList};
+
+// ---- function: args by type, return through PyResult ----
+#[pyfunction]
+fn price(sym: &str, qty: i64) -> PyResult<i64> {
+    if qty < 0 {
+        return Err(PyValueError::new_err(format!("bad qty {qty}")));
+    }
+    Ok(qty * 100)
+}
+
+// ---- your error type bridged with From (? works inside pyfunctions) ----
+#[derive(Debug)]
+struct DeskError2(String);
+impl Display for DeskError2 { /* ... */ }
+impl std::error::Error for DeskError2 {}
+impl From<DeskError2> for PyErr {
+    fn from(e: DeskError2) -> PyErr { PyValueError::new_err(e.to_string()) }
+}
+
+// ---- class: fields opt in, methods in a second impl ----
+#[pyclass]
+struct Fill { #[pyo3(get, set)] sym: String, #[pyo3(get, set)] qty: i64 }
+
+#[pymethods]
+impl Fill {
+    #[new]
+    fn new(sym: String, qty: i64) -> Self { Fill { sym, qty } }
+    fn notional(&self) -> i64 { self.qty * 100 }
+    fn __repr__(&self) -> PyResult<String> { Ok(format!("Fill({:?})", self.sym)) }
+}
+
+// ---- module: the name IS the import name ----
+#[pymodule]
+fn deskmod(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(price, m)?)?;
+    m.add_class::<Fill>()?;
+    Ok(())
+}
+```
+
+```text
+# ---- build and test ----
+cargo build
+cp target/debug/deskmod.dll deskmod.pyd      # Windows rename
+python -m pytest test_deskmod.py -s
+```
+
+Seven load-bearing sentences: **the boundary's vocabulary is i64/f64/bool/String plus containers; signatures are contracts the macros check via FromPyObject/IntoPyObject; errors cross as PyErr and your types bridge through From; classes are opt-in field by field; Python objects are born under a Python token and handed over as Py; calling Python from Rust is import/getattr/call/extract with ? at every hop; the cdylib renamed .pyd is the whole deployment.**
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 12. Review
+
+Twelve questions, in chapter order. Answers are in the prose above each.
+
+1. **(§0)** Why can no cell in this chapter `:dep pyo3`, and where does the pyo3 material actually run?
+2. **(§0.1)** Which four types form the interop vocabulary, and what happens to a Python int beyond i64?
+3. **(§1)** What does "the boundary hands out owned data, never bare &T into Python's heap" mean, and which two handle types carry it?
+4. **(§2)** Why does `sum_list(5)` raise `TypeError` before any Rust code runs?
+5. **(§2)** What does `Option<String>` in a parameter promise Python callers, and what would bare `String` do with `None`?
+6. **(§3)** What are the three error escalation levels, and when is `create_exception!` the right one?
+7. **(§3)** Why did `new_err(e.0)` print the wrong message, and what does that teach about `From<E> for PyErr`?
+8. **(§4)** What does `#[new]` register, and what happens calling the class without it?
+9. **(§4)** A `#[setter]` returns `Err(PyValueError...)` — what exception does Python see, and why not `AttributeError`?
+10. **(§5)** Why is the return type `Py<PyDict>` and not `Bound<PyDict>`, and what does `.into()` do?
+11. **(§6)** Name the four verbs of calling Python from Rust and the one operator that chains them.
+12. **(§7–§8)** What does the `py: Python` parameter buy and what does Python see of it; where does the GIL sectioning rule say the hot loop goes?
+
+### What Comes Next
+
+| Next | What it borrows from here |
+|---|---|
+| **21 — Capstone Prep** | reading maturin/setuptools docs is the chapter's doc-reading discipline aimed at packaging tools; error handling across crate boundaries is §3 generalized; benchmarking measures §1's cost ledger. |
+| **22 — Capstone** | the market-data service ships its hot pricing kernel as a pyo3 module: §4's `Fill` class is the export shape, §3's error bridge is the failure contract, §8's loop is the release process. |
+
+Carry forward: **signatures are contracts; errors cross as PyErr through From; Python objects are born under a token and detached to travel; the .pyd rename is the deployment.**
+</VSCode.Cell>

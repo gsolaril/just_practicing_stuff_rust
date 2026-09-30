@@ -1,0 +1,655 @@
+<VSCode.Cell language="markdown">
+# Rust 113: Modules, Crates and Testing
+
+Chapter 13 of the Rust track, and the chapter about *scale* — not bigger programs, but programs whose parts can be named, bounded, and proven. Every function you have written so far lived in one flat namespace, the "crate root" the kernel has been wrapping cells into. This chapter makes the tree explicit: **modules** carve the namespace, **visibility** decides what crosses each boundary, **paths** (`crate::`, `super::`, `self::`) navigate it, `use` rewrites the lookup table, and **tests** — the `#[test]` functions this track has been rehearsing since chapter 01 — finally get their machinery explained. Everything here is std-only and in-process.
+
+Everything here is a **runnable example**. Read the markdown, run the cell below it, and change nothing — the practice twin of this notebook is `13_modules-crates-and-testing_p.ipynb`.
+
+## Who this is written for
+
+You are assumed to be a competent programmer arriving from Python and C++. Python's `import` and `__init__.py`, C++'s headers and translation units — none of that is new. What is new: Rust's module system is resolved **at compile time from the source tree alone** — there is no import-time execution, no header/implementation split, no linker-visible mangling to negotiate. A module is *not* a file (an inline `mod` block is right here in this file), a file is *not* a unit of visibility (privacy is per-module, not per-file), and the crate is the boundary the compiler actually reasons about. The test story is the same kind of different: tests are ordinary functions with an attribute, compiled *into* the same binary by a conditional-compilation switch, not a separate test runner importing your code.
+
+## How to read this notebook
+
+- Markdown cells explain; code cells demonstrate. **Run each code cell as you reach it.** Cells are independent — no sandbox, no files touched, so restart-and-run-from-the-top always works.
+- Code that intentionally *fails* is shown as a comment, together with the diagnostic you would get. §8 is the catalogue.
+- The `pantry` module family from §1 stays live for the whole notebook — §2's privacy rules, §3's paths and §6's test modules all reuse it.
+- One honest limitation runs through §6: the kernel has **no test harness**. This notebook teaches tests with the harness's own words in the prose, and demonstrates the *bodies* by calling the functions directly. §7 shows the `cargo test` output you would see outside the kernel.
+
+## The one idea to internalise
+
+**The module tree is the privacy fence; the test module is a resident inside it.** `mod` draws a boundary; `pub` is an explicit hole in it; everything not marked `pub` is visible *downward* only (a module's own children can see its private items — that is the chapter's least obvious rule). `use` does not import *code*, it imports *names* into the current module's lookup table — which is why `as` renames, globs merge, and re-exports (`pub use`) change what the fence lets out. And because `#[cfg(test)]` gates the test module on compilation-with-tests, the tests live *inside* the thing they test, seeing its private items the way children do. Chapter 05's ownership fence kept memory honest; this fence keeps *interfaces* honest.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+### Contents
+
+- [0. Notebook Conventions: How These Cells Run](#0-notebook-conventions-how-these-cells-run)
+- [1. The Module Tree: `mod` Draws the Fence](#1-the-module-tree-mod-draws-the-fence)
+- [2. Visibility: `pub`, `pub(crate)`, `pub(super)`](#2-visibility-pub-pubcrate-pubsuper)
+- [3. Paths: `crate::`, `super::`, `self::`](#3-paths-crate-super-self)
+- [4. `use`: The Name Rewriter](#4-use-the-name-rewriter)
+- [5. Crates, Files and `cargo`: The Other Half](#5-crates-files-and-cargo-the-other-half)
+- [6. `#[test]`: Tests as Ordinary Functions](#6-test-tests-as-ordinary-functions)
+- [7. `cargo test`: What the Harness Adds](#7-cargo-test-what-the-harness-adds)
+- [8. Reading the Compiler: E-Codes](#8-reading-the-compiler-e-codes)
+- [9. Mental Model: The Tree](#9-mental-model-the-tree)
+- [10. Cheat Sheet](#10-cheat-sheet)
+- [11. Review](#11-review)
+
+If you are returning to this chapter later, §10 is the one-page summary, §8 the diagnostics catalogue, and §6–§7 the testing machinery.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 0. Notebook Conventions: How These Cells Run
+
+This notebook runs on the **evcxr** kernel, which wraps each cell into a generated program and compiles it incrementally. Three consequences matter for every cell below:
+
+- **There is no `fn main`.** The kernel supplies one; you are typing its body.
+- **State persists across cells.** A `let` from cell 4 is still live in cell 20 — including `use` statements.
+- **Items are order-independent, statements are not.** Two `fn`s may call each other regardless of order; two `let`s may not use each other's names before they run.
+
+There is **one namespace per notebook**. Two items with the same name collide exactly as they would in one source file, even in different sections. This chapter *defines modules*, which makes the rule concrete: every `mod` name below is unique across the notebook — a re-`mod` is the same redefinition error as a re-`fn` (E0428, §8). If you re-run a cell that defines an item, it is redefined; on a redefinition error, restart the kernel and run from the top.
+
+A failing cell does not poison the kernel — the deliberate compile errors in this chapter are comments, so every cell still runs.
+
+### A chapter about names, in a namespace that persists
+
+Two consequences of the kernel model bite this chapter specifically. First, a `use` line from an early cell stays imported for the whole notebook — exactly like chapter 06's one-`use`-per-type rule, now with a reason behind it. Second, the kernel's generated wrapper is *effectively* the crate root: a `mod` block in a cell is a module **nested inside it**, and every rule about parent/child visibility in §2 is exercised across that boundary.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 0.1 Smoke test: a module, a path, a call — the chapter's whole shape in one cell.
+mod startup {
+    pub fn answer() -> u32 {
+        42
+    }
+}
+assert_eq!(startup::answer(), 42);
+println!("kernel alive: mod, path, call");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 1. The Module Tree: `mod` Draws the Fence
+
+A **module** is a named scope that groups items and draws a privacy boundary around them. There are two spellings — inline (`mod pantry { .. }`, right here in the file) and file-based (`mod pantry;`, which loads `pantry.rs` or `pantry/mod.rs`) — and they are **the same construct** to the compiler: both define `pantry` as a child of whatever module the declaration sits in. The tree that results is what the compiler resolves names and privacy against, and the crate root (where the kernel's wrapper lives) is its trunk.
+
+```text
+crate root (the kernel's wrapper / src/main.rs or src/lib.rs)
+├── mod pantry            (this chapter's running family)
+│   ├── struct Flour, fn restock, fn secret ...
+│   └── mod shelf
+│       └── fn top, fn for_parent
+└── mod kitchen
+    └── fn bake, fn knead
+```
+
+### The family, declared
+
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 1.1 Two sibling modules: paths and private fields, exercised from the root.
+mod pantry {
+    pub struct Flour {
+        pub cups: u32,
+        brand: String, // private field: the default
+    }
+    impl Flour {
+        pub fn new(cups: u32) -> Self {
+            Flour { cups, brand: "generic".into() }
+        }
+        pub fn brand(&self) -> &str {
+            &self.brand
+        }
+    }
+    pub fn restock() -> u32 {
+        2
+    }
+    fn secret() -> u32 {
+        4 // private to pantry... and to pantry's children (§2)
+    }
+    pub fn call_secret() -> u32 {
+        secret() // same module: fine
+    }
+    pub mod shelf {
+        pub fn top() -> u32 {
+            50
+        }
+        pub(super) fn for_parent() -> u32 {
+            51 // visible to pantry only - the pub(super) ceiling (§2)
+        }
+        pub fn reach_down() -> u32 {
+            super::secret() // a CHILD reading the parent's private fn: allowed
+        }
+    }
+    pub fn use_shelf() -> u32 {
+        shelf::for_parent() // pub(super): pantry is shelf's parent - visible here
+    }
+}
+mod kitchen {
+    pub fn bake() -> u32 {
+        let f = super::pantry::Flour::new(3); // super:: = the root, from kitchen
+        f.cups + super::pantry::restock()     // a bare `pantry::` here would be
+    }                                         // E0433: a child does not see the
+}                                             // root's names without an anchor
+let f = pantry::Flour::new(2);
+assert_eq!(f.cups, 2);
+assert_eq!(f.brand(), "generic"); // the field is private; the accessor is the gate
+// println!("{}", f.brand);
+// error[E0616]: field `brand` of struct `Flour` is private
+assert_eq!(pantry::restock(), 2);
+assert_eq!(pantry::shelf::top(), 50);
+assert_eq!(kitchen::bake(), 5); // 3 cups + 2 restocked
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+Three reads on that cell. **The fence is per-field, not per-type**: `Flour` is `pub` (constructible and callable from outside) but its `brand` field is not — E0616 names the *field*, and the accessor method is how a module exposes a private field without exposing it. **Paths grow with the tree**: `pantry::shelf::top()` is just the tree read aloud, and inside `kitchen` the sibling module is named through the parent, `super::pantry::..` — a bare `pantry::restock()` from there is E0433, because **the first segment of a bare path resolves in the current module and does not climb** toward the root (the root's *items* are inherited, their names are not). **Nesting is free**: `shelf` inside `pantry` is one more fence between `top()` and the world; §2 wires its visibility knob.
+
+### `mod` in the kernel, honestly stated
+
+One structural note before the fences get finer: the kernel's wrapper is the crate root, so a cell's `mod pantry { .. }` is a module nested one level down — *not* a sibling of `main.rs`'s modules as it would be in a file tree. Every rule in this chapter is exercised exactly as stated, because the wrapper is a module like any other; the one visible difference is that `super::` from inside a cell's module points at the wrapper, which is why `kitchen::bake` above reaches `pantry` through it.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 2. Visibility: `pub`, `pub(crate)`, `pub(super)`
+
+The default is **private**, and private means something precise: *visible to the declaring module and its descendants, and to nothing else*. Privacy flows **down** the tree — a child can read the parent's private items, an outsider cannot — which is the inverse of the intuition Python's `_` convention suggests and C++'s `private:` enforces (there, private is per-class; here it is per-module, and classes are just items in the fence).
+
+| Spelling | Visible to | The typical job |
+|---|---|---|
+| *(nothing)* | the module + its descendants | the internal helper, the private field |
+| `pub` | everyone who can *name* the path | the module's public surface |
+| `pub(crate)` | the whole crate, but no external crate | shared internals: two modules, one helper |
+| `pub(super)` | the parent module only | the child's offering to its immediate parent |
+| `pub(in path)` | a named ancestor | rare; the surgical version of `pub(super)` |
+
+The visibility modifiers are not a security system — they are an **interface budget**. Everything `pub` is something you promise not to change casually; everything private is freedom to refactor. The goal is the smallest `pub` surface that reads well.
+
+### Downward privacy, and the `pub(super)` ceiling
+
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 2.1 Privacy flows down; pub(super) stops at the parent.
+// The §1.1 family carries the privacy knobs; this cell probes them in place.
+assert_eq!(pantry::call_secret(), 4);
+assert_eq!(pantry::shelf::reach_down(), 4); // downward privacy, the key fact
+assert_eq!(pantry::use_shelf(), 51); // the parent can see what was offered
+// pantry::shelf::for_parent() from here would be E0603: pub(super) stops at pantry
+// error[E0603]: function `for_parent` is private
+println!("privacy: down flows, pub(super) capped at one level");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+**`pub(super)` is a ceiling, not a door**: it lifts the item exactly one level, and a caller one level higher than that gets E0603 with no hint that "almost pub" was intended. The probe behind this cell confirmed the sharp edge: even a path spelled `super::super::..` from deeper down cannot reach past the ceiling — visibility is decided by the *accessing module's ancestry*, not by how the path was spelled.
+
+### `pub(crate)`: the shared-internal knob
+
+`pub(crate)` is the workhorse of real crates: two sibling modules need one helper, and making it `pub` would widen the API for no reason. From the root — which is where every kernel cell effectively stands — `pub(crate)` items look exactly like `pub` ones. The difference is real for **library consumers** (chapter 15 onward): a `pub` item of a library crate crosses the boundary; a `pub(crate)` one does not exist outside it.
+
+### The two knobs, side by side
+
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 2.2 pub(crate) and pub: indistinguishable from the root, different promises.
+mod storage {
+    pub(crate) fn cache_clear() -> usize {
+        1
+    }
+    pub fn cache_len() -> usize {
+        7
+    }
+}
+mod analytics {
+    pub fn uses_internals() -> usize {
+        crate::storage::cache_clear() + crate::storage::cache_len()
+    }
+}
+assert_eq!(analytics::uses_internals(), 8);
+// From the root both resolve identically; the difference is the promise:
+// `pub` says "outsiders may call this"; `pub(crate)` says "the crate may".
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 3. Paths: `crate::`, `super::`, `self::`
+
+A **path** is how you name an item across the tree: `pantry::shelf::top()` reads down from the current module, `crate::pantry::restock()` reads down from the root, `super::restock()` reads up one level. The three anchors are the whole grammar:
+
+| Anchor | Starts at | The habit it encodes |
+|---|---|---|
+| `crate::` | the crate root | absolute: names the item no matter where the code moves |
+| `super::` | the parent module | relative: "my sibling", "my parent's helper" — survives renames of the root |
+| `self::` | the current module | explicit: `use self::gadget::Part` disambiguates a local `gadget` from a `use`d one |
+
+Path *resolution* happens against the tree at compile time; there is no runtime lookup, no path that can fail at execution. What can fail is **resolution**: name the wrong module and the compiler names the nearest candidate it knows (the `unresolved import` text is the §8 catalogue's entry).
+
+### The anchors, exercised together
+
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 3.1 crate::, super:: and self:: in one tree; the enum-variant path too.
+mod garage {
+    pub const CAP: u32 = 3;
+    pub mod tools {
+        pub fn spanner() -> u32 {
+            9
+        }
+    }
+    pub mod bench {
+        pub fn from_root() -> u32 {
+            crate::garage::CAP // absolute: root, garage, CAP
+        }
+        pub fn from_parent() -> u32 {
+            super::tools::spanner() // relative: parent's sibling
+        }
+        pub mod parts {
+            pub type Bolt = u32;
+        }
+        pub fn local_alias() -> self::parts::Bolt {
+            let bolts: self::parts::Bolt = 2;
+            bolts
+        }
+    }
+    #[derive(Debug, PartialEq)]
+    pub enum Gear {
+        Low,
+        Reverse,
+    }
+}
+// self:: inside the group names the enum itself
+use garage::Gear::{self, Reverse};
+assert_eq!(garage::bench::from_root(), 3);
+assert_eq!(garage::bench::from_parent(), 9);
+let bolts: garage::bench::parts::Bolt = garage::bench::local_alias();
+assert_eq!(bolts, 2);
+assert_eq!(Gear::Low, garage::Gear::Low);
+assert_eq!(Reverse, garage::Gear::Reverse); // the variant itself was imported
+let gear = Gear::Low;
+println!("gear = {gear:?}, reverse = {Reverse:?}");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 4. `use`: The Name Rewriter
+
+`use` does not move code — it **binds a name into the current module's lookup table**. `use crate::pantry::Flour;` gives the current scope the bare name `Flour` for the path it already had; the item itself never travels. Every rule about `use` follows from that one sentence:
+
+- **`as` renames** — two modules both exporting `Queue`? `use a::Queue as WorkQueue;` resolves the collision without qualifying a single callsite.
+- **Globs (`use m::*;`) merge by name** — and a collision between two globs is not an error until the ambiguous name is *used*.
+- **`pub use` re-exports** — the name becomes part of *this* module's public surface: the API-shaping move that lets a crate present a flat facade over a deep tree.
+- **`use` paths start at the crate root or the current module** — `crate::..` or `self::..`; bare names in a `use` are not looked up dynamically the way expression paths are.
+
+The kernel consequence from §0 now has its mechanism: a `use` line lives for the whole notebook because it wrote a row into the crate root's lookup table — the same table every later cell reads.
+
+### The four moves, exercised
+
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 4.1 rename, glob, re-export, nested groups - the use toolbox.
+mod feeds {
+    pub mod raw {
+        pub struct Tick {
+            pub px: u32,
+        }
+        pub fn count() -> u32 {
+            1
+        }
+    }
+    pub mod clean {
+        pub struct Tick {
+            pub px: u32,
+        }
+        pub fn count() -> u32 {
+            2
+        }
+    }
+    pub mod gadget {
+        pub fn spin() -> u32 {
+            3
+        }
+        pub fn halt() -> u32 {
+            4
+        }
+    }
+    pub use self::clean::Tick as FeedTick; // the facade: clean::Tick is THE Tick
+}
+// rename: two Ticks, one scope, both reachable
+use feeds::raw::Tick as RawTick;
+// the re-export, imported like any local item
+use feeds::FeedTick;
+let r = RawTick { px: 100 };
+let c = FeedTick { px: 101 };
+assert_eq!((r.px, c.px), (100, 101));
+// glob: everything in gadget, minus the ceremony
+use feeds::gadget::*;
+assert_eq!((spin(), halt()), (3, 4));
+// the two modules' own helpers stay reachable the long way:
+assert_eq!((feeds::raw::count(), feeds::clean::count()), (1, 2));
+// nested groups: `self` names the module, then its children in braces
+mod spices {
+    pub fn salt() -> u32 {
+        9
+    }
+    pub fn pepper() -> u32 {
+        10
+    }
+}
+use spices::{self as sp, pepper};
+assert_eq!((sp::salt(), pepper()), (9, 10));
+println!("use toolbox: rename + glob + re-export + self-group all live");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+The re-export row is the one to internalise: `feeds::FeedTick` works *only* because `feeds` chose to publish `clean::Tick` under its own name — `raw::Tick` had to be reached the long way. **`pub use` is how a crate's public API is designed**, independent of how its internal tree is laid out; the std prelude is a giant `pub use` (which is why `Vec` needs no import at all). Two sharp edges the probes confirmed: a rename alone (`use a::f as g;` and never calling `g`) is an **unused import warning** — `use` writes the table row, nothing reads it; and glob + specific of the *same* item is legal, the specific winning silently.
+
+### `use` vs expression paths
+
+`use crate::pantry::Flour;` and calling `crate::pantry::Flour::new(..)` inline are the same resolution — `use` is a convenience, not a capability. The exceptions worth naming: `use` is required for **globs**, **renames** and **re-exports**, and it is the only way to shorten a path used at many callsites. One rule already learned in chapter 07 applies with force here: **`use` lines must not carry trailing `//` comments** — the validator's item collector consumes the next statement into the item; the kernel tolerates it, the harness does not.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 5. Crates, Files and `cargo`: The Other Half
+
+Everything so far happened inside one file, but the tree it drew is the tree a real project gets by **layout**:
+
+```text
+pricefeed/
+├── Cargo.toml          # name, edition, dependencies — the crate's identity
+└── src/
+    ├── lib.rs          # a LIBRARY crate: `cargo build` makes an .rlib for others
+    │   ├── mod pantry; ← src/pantry.rs       (or src/pantry/mod.rs + submodule files)
+    │   └── mod kitchen; ← src/kitchen.rs
+    └── main.rs         # a BINARY crate: `cargo run` makes an executable
+```
+
+The correspondence is mechanical: **`mod x;` declares the node, the file system stores it**. `src/pantry.rs` is *inside* `pantry`, not beside it — which is why `super::` from `pantry.rs` reaches `lib.rs`'s items. `Cargo.toml` fixes edition and dependencies; `cargo build` compiles one crate as a unit — the compilation unit is the crate, never the file, which is why there are no headers to keep in sync and no import-order fights.
+
+### Two crates, one tree — and what crosses the boundary
+
+A package can hold both halves: `main.rs` (binary) and `lib.rs` (library). The binary uses the library through the **package name** — `use pricefeed::pantry::Flour;` — because the library is its own dependency, not a sibling module: from the binary's point of view the library's tree is a black box entered only by its `pub` surface. The library's `pub(crate)` items stop at the library's edge; its `pub` items cross. **Visibility is the export control; the crate is the border.** Chapter 15's crates arrive with versions and registries, but the fence grammar is this chapter's.
+
+### The tests live in the same files
+
+The `#[cfg(test)] mod tests` block that `cargo new` drops into every library lands **inside** `lib.rs` — a child of the crate root, gated behind the test compilation switch. That placement is not a convention but the whole design: the test module is a *descendant*, so it sees `pub` and private items alike (§2's downward rule), with `use super::*;` pulling the parent's names in. §6–§7 unpack the switch.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 6. `#[test]`: Tests as Ordinary Functions
+
+A test is **a function with one attribute**:
+
+```rust
+#[test]
+fn add_small() {
+    assert_eq!(add(2, 2), 4);
+}
+```
+
+No trait to implement, no base class, no runner to register with — `#[test]` marks the function, and the *test harness* (§7) collects every marked function and calls it. The attribute gates on `cfg(test)` — the compilation switch `cargo test` flips — so the same source compiles twice: **without** tests, the `#[test]` functions do not exist in the binary at all; **with** tests, they exist and the harness's generated `main` drives them. Everything you already know about functions applies: they may return `()` or `Result`, they may live in any module, and they see private items of the modules they nest in.
+
+### The kernel's honest limitation
+
+This notebook runs on **evcxr**, which compiles each cell the way plain `rustc` does — and plain `rustc` does not build the harness. The probed consequences, stated once and used all through §6:
+
+- **`#[test]` functions are stripped from the compilation** (not merely skipped): calling one from a cell is E0425, `cannot find function`. The harness is what generates the `main` that calls them; without it, nothing references them, so conditional compilation removes them entirely.
+- **`cfg!(test)` is `false`** in every kernel cell — `cfg!(test)` is a *compile-time* predicate evaluated by plain rustc, which does not set the test configuration.
+- **`#[should_panic]` is inert** — it is an instruction to the harness, not to the function. The chapter-11 alternative, `catch_unwind`, is how the same fact is tested in-process.
+- What *is* checkable in a cell is the **body**: call the logic directly, assert, and let the check line prove it — which is precisely what the `// --- check (do not modify) ---` blocks of the practice notebooks have been doing since chapter 01.
+
+### The shapes, demonstrated in body form
+
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 6.1 The test shapes, exercised as the harness would exercise them.
+mod calc {
+    pub fn add(a: i32, b: i32) -> i32 {
+        a + b
+    }
+    pub fn div(a: i32, b: i32) -> i32 {
+        if b == 0 {
+            panic!("division by zero");
+        }
+        a / b
+    }
+    // In a real crate these would carry #[test]; in the kernel the bodies are
+    // called from the check below, because plain rustc strips #[test] fns.
+    pub fn add_small() {
+        assert_eq!(add(2, 2), 4);
+    }
+    pub fn add_negative() {
+        assert_eq!(add(-2, 2), 0);
+    }
+    pub fn returns_result() -> Result<(), String> {
+        if add(1, 1) == 2 {
+            Ok(())
+        } else {
+            Err("math broke".into())
+        }
+    }
+}
+// the three shapes the harness knows:
+calc::add_small(); // plain assert test
+calc::add_negative();
+assert_eq!(calc::returns_result(), Ok(())); // Result-returning test
+// the failing case, the way the harness would report it:
+let failed = std::panic::catch_unwind(|| assert_eq!(calc::add(2, 2), 5));
+assert!(failed.is_err());
+// and should_panic, in-process: the panic must HAPPEN and must be THE panic
+let panicked = std::panic::catch_unwind(|| calc::div(1, 0));
+let msg = panicked
+    .err()
+    // a literal panic! boxes a &'static str (chapter 11), not a String
+    .and_then(|payload| payload.downcast_ref::<&str>().copied())
+    .unwrap_or_default();
+assert!(msg.contains("division by zero"));
+println!("shapes: assert, Result, catch-panic - the harness's whole vocabulary");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+The last block is the honest `#[should_panic]`: catch the unwind, **downcast the payload, and check the message** — a bare `catch_unwind` that merely observes *a* panic would pass on the wrong panic, exactly the way a bare `#[should_panic]` without `expected =` would. The payload-shape lesson is chapter 11's: `panic!("..")` with a formatted string boxes a `String`; `panic!("literal")` boxes a `&'static str`.
+
+### `#[cfg(test)]`: the switch itself
+
+`#[cfg(test)]` is **conditional compilation**: the annotated item exists only when the test configuration is on. It is how a whole test module disappears from `cargo build`'s output without a single `#[allow(dead_code)]` — and it is the gate the `cargo new` test module (§5) sits behind. Probed behavior in one cell: a gated helper stripped from the binary, a `cfg!` expression folding to `false`, and a body that compiles on both sides of the switch:
+
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 6.2 cfg(test) gates items; cfg!(test) asks the question at compile time.
+mod gated {
+    #[cfg(test)]
+    pub fn test_only_helper() -> u32 {
+        99
+    }
+    pub fn always_here() -> u32 {
+        11
+    }
+}
+assert_eq!(gated::always_here(), 11);
+// gated::test_only_helper() would be E0425 here: under plain rustc the
+// #[cfg(test)] item is stripped, the name never exists.
+// error[E0425]: cannot find function `test_only_helper` in this scope
+let in_kernel = cfg!(test);
+assert!(!in_kernel); // folds to false: plain rustc does not set the test config
+// if in_kernel { print!("{}", gated::test_only_helper()); } would not compile:
+// the false branch must still compile, and under plain rustc the name is gone.
+// error[E0425]: cannot find function `test_only_helper` in this scope
+println!("cfg!(test) = {in_kernel} in the kernel; in the harness main it is true");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+The distinction that survives into real projects: `#[cfg(test)]` *removes items* when tests are off, while `cfg!(test)` is an *expression* that folds to `true`/`false` at compile time — usable in `if`, but the `false` branch still has to **compile**. The harness inverts the switch: `cargo test` compiles your crate twice, once as the library (tests stripped) and once as the test binary (tests in, `main` generated to run them).
+
+## 7. `cargo test`: What the Harness Adds
+
+Outside the kernel, the harness is one flag with a lot of machinery behind it: `rustc --test` (or `cargo test`, which is that flag plus crate plumbing). What it adds, probed on this exact toolchain:
+
+| Mechanism | What it does | The kernel equivalent |
+|---|---|---|
+| collects every `#[test]` fn | generates the `main` that calls them | the check block's direct calls |
+| names tests by path | `tests::good`, `tests::bad` — module tree as test filter | the `Exercise N.M passed` lines |
+| `assert_eq!` failure report | `left: 4`, `right: 5` per failing test, run continues | the panic aborts the cell |
+| `#[should_panic(expected = "..")]` | the panic must happen *and* contain the text | `catch_unwind` + downcast |
+| Result-returning tests | `Err(..)` = failure with the error as message | `assert_eq!(f(), Ok(..))` |
+| `#[cfg(test)]` on | the test binary sees test-gated items | off — items are stripped |
+| doc tests | code fences in `///` docs are compiled and run | not applicable |
+
+### The output, verbatim
+
+The probed run — three tests, one deliberately failing — printed exactly this (names, report, and the summary line the whole ecosystem scripts against):
+
+```text
+running 3 tests
+test tests::bad ... FAILED
+test tests::panics - should panic ... ok
+test tests::good ... ok
+
+failures:
+
+---- tests::bad stdout ----
+
+thread 'tests::bad' (60508) panicked at src\lib.rs:26:9:
+assertion `left == right` failed
+  left: 4
+ right: 5
+
+failures:
+    tests::bad
+
+test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+```
+
+Three reads on it. **One failing test does not stop the run** — `good` and `panics` still report `ok` after `bad` fails, because the harness catches each panic and moves on; that isolation is the difference between a *test suite* and a chain of asserts. **The failure report is the chapter-08 `assert_eq!` payload**, prefixed by the test's path and source location — the same `left`/`right` you have read all along, now attributed. **`test result:` is the exit-code contract**: `FAILED` sets a non-zero exit, which is what CI counts and what this track's `_solN_gen.py` harnesses grep for in their own way.
+
+### Doc tests: the docs are a test suite
+
+One more collection the harness runs, easy to miss until CI shows you a test you never wrote. Every fenced code block inside a `///` (or `//!`) doc comment becomes its own compiled-and-run test. Each fence is extracted into a generated crate, built against your library, and executed — so the example in your docs either compiles and passes, or the build goes red. Probed on this toolchain, the passing doc test reports as `test src\\lib.rs - bump (line 3) ... ok`: file, the function the doc is attached to, and the line the fence starts on. A failing one names the function and line too, but the panic location is a throwaway temp file (`rustdoctest…doctest_bundle_*.rs`) — the harness's scratch copy, not your `src`. The doc-test output prints in its own section after the unit tests, under its own `running` line.
+
+The kernel cannot run doc tests — they are a harness feature, extracted and built by cargo — so here the form is shown rather than executed. The fence below is real doc-comment syntax; rustc stores it as documentation and this track's plain-rustc gate ignores it. The assert after the definition is the kernel-side stand-in, the same code the fence carries:
+
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+/// Bumps a score by one.
+///
+/// ```
+/// let s = bump(4);
+/// assert_eq!(s, 5);
+/// ```
+fn bump(n: i32) -> i32 {
+    n + 1
+}
+
+// Under `cargo test` the fence above is extracted and run as a Doc-test:
+//   test src\lib.rs - bump (line 3) ... ok
+// In the kernel, the same lines run inline:
+let s = bump(4);
+assert_eq!(s, 5);
+println!("doc-test example, run inline: s = {s}");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+That closes the harness tour: plain functions marked `#[test]`, collected and named by path, isolated per panic, gated by `#[cfg(test)]` so the shipping build carries none of it — with doc fences thrown into the same net. When any of it breaks, the compiler has a vocabulary for saying exactly how, and that vocabulary is next.
+
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 8. Reading the Compiler: E-Codes
+
+The fence fails in five ways, and each failure mode has its own diagnostic. Every wording below was captured from this exact toolchain — and every fix is a section of this chapter, because the module system's diagnostics are the tree talking.
+
+| Diagnostic | Trigger | Message (captured) | Fix |
+|---|---|---|---|
+| **E0428** | two `mod dup { .. }` blocks in one namespace | ``the name `dup` is defined multiple times`` + ``must be defined only once in the type namespace of this module`` | one definition; extend the existing module instead of re-declaring (§0) |
+| **E0603** | calling a private (or `pub(super)`-capped) item from outside | ``function `for_parent` is private`` | widen with `pub`/`pub(crate)`, or reach it through the parent's own code (§2) |
+| **E0616** | touching a private *field* from outside | ``field `hidden` of struct `S` is private`` | add an accessor method — the gate §1 built for `Flour::brand` (§1, §2) |
+| **E0432** | `use` of a path that does not exist | ``unresolved import`` + ``no `prod` in the root`` | fix the path — the tree is literal, typo or wrong level both land here (§3) |
+| **E0425** | calling an `#[test]`/`#[cfg(test)]` item under plain rustc | ``cannot find function `````test_only_helper````` in this scope`` | the item is *stripped*, not hidden — run it under the harness, or call the body directly (§6) |
+
+Three worth dwelling on. **E0428 says "type namespace"** because Rust namespaces items by kind — a fn and a struct of one name can coexist — but two *modules* share the type namespace, so a duplicate `mod` is the textbook trigger; in this notebook it is also the re-run hazard (§0). **E0603 is the `pub(super)` ceiling's signature**: nothing in the message hints that "almost pub" was intended, because visibility was decided by the accessing module's ancestry, not by the path spelling (§2). **E0425 from a stripped test is the harness distinction made visible**: the function is not merely *skipped* — conditional compilation removes the item, the name, and everything about it; only the test binary (§7) knows it existed.
+
+### The catalogue, exercised
+
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 8.1 The fence diagnostics, dodged in one cell each.
+// E0428 dodged: ONE namespace, ONE definition of each module name.
+mod dup {
+    pub fn go() -> u32 {
+        1
+    }
+}
+// A second `mod dup { .. }` in another cell would end the notebook:
+// error[E0428]: the name `dup` is defined multiple times
+//   = note: `dup` must be defined only once in the type namespace of this module
+// E0432 dodged: use the path that exists.
+use dup::go;
+assert_eq!(go(), 1);
+// use dup::prod;   <- no such item
+// error[E0432]: unresolved import `dup::prod`
+// E0603 dodged: pub(super) items are reached through the parent (§2).
+assert_eq!(pantry::use_shelf(), 51);
+// pantry::shelf::for_parent() would be:
+// error[E0603]: function `for_parent` is private
+// E0616 dodged: the accessor is the gate; the field is not.
+assert_eq!(pantry::Flour::new(1).brand(), "generic");
+// E0425 dodged: the body is called, not the stripped #[test] fn (§6).
+assert_eq!(calc::add(2, 2), 4);
+println!("five diagnostics known: E0428, E0432, E0603, E0616, E0425");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 9. Mental Model: The Tree
+
+| Question | Answer with | Where |
+|---|---|---|
+| "How do I group code and bound it?" | `mod name { .. }` — a named scope and a fence | §1 |
+| "Who can see an item?" | the declaring module + descendants; `pub` is the explicit hole | §2 |
+| "How far does `pub(super)` reach?" | exactly one level up — a ceiling, not a door | §2 |
+| "How do I name something across the fence?" | a path: `crate::` down from the root, `super::` one up, `self::` for here | §3 |
+| "How do I stop spelling the whole path?" | `use` — it rewrites the lookup table, it does not move code | §4 |
+| "How do two crates talk?" | through the package name; visibility is the export control, the crate is the border | §5 |
+| "How do I prove a function?" | `#[test]` on an ordinary fn — the body is what you call | §6 |
+| "Who runs the tests?" | the harness: `cargo test`, names by path, `test result:` is the exit code | §7 |
+| "Why did the name vanish?" | `#[test]`/`#[cfg(test)]` items are stripped when tests are off | §6, §8 |
+
+Read the table as the tree's control panel: **draw** (`mod`), **gate** (visibility), **navigate** (paths), **rewrite** (`use`), **ship** (crates), **prove** (tests). Python scatters tests in files that import the module; C++ bolts a separate test binary onto headers; Rust plants the tests *inside* the fence they verify — same tree, same privacy rules, children reading the parent's private items — and strips them from the shipped build with one attribute. The fence from chapter 05 kept memory honest; this tree keeps interfaces honest, and the tests are residents, not inspectors.
+
+## 10. Cheat Sheet
+
+| Task | Code |
+|---|---|
+| draw a fence | `mod pantry { .. }` — inline; `mod pantry;` — the file `pantry.rs` |
+| the default | private: visible to the module + its descendants only |
+| the public hole | `pub fn`, `pub struct` — fields stay private until marked |
+| shared internals | `pub(crate) fn helper()` — the whole crate, no external crate |
+| offer to the parent | `pub(super) fn for_parent()` — visible one level up, no further |
+| go absolute | `crate::pantry::restock()` |
+| go relative | `super::secret()` — the parent; `self::parts::Bolt` — explicit here |
+| bind a short name | `use crate::pantry::Flour;` |
+| resolve a collision | `use a::Queue as WorkQueue;` |
+| pull everything | `use gadget::*;` — merges by name; ambiguity fails only at use |
+| shape the API | `pub use self::clean::Tick as FeedTick;` — re-export from a facade |
+| group an import | `use spices::{self as sp, pepper};` — the module *and* its items |
+| mark a test | `#[test] fn add_small() { assert_eq!(add(2, 2), 4); }` |
+| expect the panic | `#[test] #[should_panic(expected = "division by zero")]` |
+| fallible test | `#[test] fn parses() -> Result<(), String> { .. }` |
+| gate a test module | `#[cfg(test)] mod tests { use super::*; .. }` |
+| strip-proof check | plain rustc: `#[test]`/`#[cfg(test)]` items do not exist (E0425) |
+| run the suite | `cargo test` — read the last line: `test result: ok.` or `FAILED` |
+
+## 11. Review
+
+Answer from memory; each one is a §-numbered cell away.
+
+1. What are the two spellings of `mod pantry`, what does the compiler think of them, and which one did every cell in this notebook use — with what structural consequence for `super::`? (§1)
+2. `Flour` is `pub` but `f.brand` was E0616. What exactly was private, and which two mechanisms expose it without publishing it? (§1, §2)
+3. `shelf::reach_down()` read `super::secret()`, a private function of its *grandparent's* owner. Which direction does privacy flow, and what would the mirror-image call from outside have hit? (§2)
+4. `pub(super) fn for_parent()` is callable from `pantry::use_shelf` but not from the crate root. What decides visibility — the path spelled or the caller's ancestry — and what does the diagnostic say? (§2, §8)
+5. From the root, `pub(crate)` and `pub` items resolve identically. Where does the difference live, and which promise does each modifier make? (§2)
+6. Inside `kitchen`, both `super::pantry::..` and bare `pantry::..` resolved. What is each anchor, and why did the bare form work at all? (§3)
+7. `use feeds::FeedTick;` worked, `feeds::clean::Tick` needed the long path. What construct published the short name, and which std-wide example of it means `Vec` needs no import? (§4)
+8. A `use a::f as g;` that never calls `g` draws a warning. What does this prove `use` actually does, and which kernel rule made the table row permanent for the whole notebook? (§4, §0)
+9. A package has `main.rs` and `lib.rs`. How does the binary name the library's items, and which boundary do the library's `pub(crate)` items stop at? (§5)
+10. Under plain rustc, calling an `#[test]` fn is E0425 — not merely skipped. What exactly happens to the function, and which switch makes it exist again? (§6, §7)
+11. In the verbatim §7 output, `tests::bad` FAILED but `tests::good` still reported `ok`. What does the harness do around each test, and which line of the summary does CI read? (§7)
+12. `#[should_panic]` without `expected` and a bare `catch_unwind` share a weakness. What is it, and what does each tool add to pin the *right* panic? (§6, §7)
+
+### What Comes Next
+
+The fence grammar is complete; what follows puts it to work at larger scales:
+
+| Chapter | Title | What it settles |
+|---|---|---|
+| **14** | **Smart Pointers and Interior Mutability** | `Rc`/`RefCell` — sharing across the fence without publishing internals |
+| 15 | Data Types and Their Libraries | the crate as the unit you *consume*: dependencies, `polars` at library scale |
+| 16 | Concurrency | threads as modules with moving parts — and tests that isolate by construction |
+
+**Carry forward.** You should now be able to do these without looking anything up:
+
+- draw the `mod` tree for a given file layout — and the layout for a given tree
+- state the visibility default and place `pub`, `pub(crate)`, `pub(super)` on it
+- navigate with `crate::`, `super::`, `self::` and rewrite names with `use`, `as`, globs, `pub use`
+- write a test as an ordinary function — assert, `should_panic`, `Result` — and know what plain rustc strips
+- read `cargo test` output down to `test result:` and say which line the exit code follows
+- name the five E-codes of the fence and the fix each one is asking for
+</VSCode.Cell>

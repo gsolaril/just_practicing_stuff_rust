@@ -1,0 +1,505 @@
+<VSCode.Cell language="markdown">
+# Rust 121: Capstone Prep — Practice
+
+Companion exercises for `21_capstone-prep_e.ipynb`. Every section mirrors the section of the same number in the example notebook, and every runnable cell has an exercise. The desk tools (criterion, `cargo add`, the registry) stay in spike21 with their receipts quoted in the example notebook; these cells exercise the *decisions* those receipts inform, in kernel-honest Rust.
+
+The checks at the bottom of each cell are the grader. Edit only the `todo!()` bodies; when a cell runs without panicking you will see an `Exercise N.M passed` line.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+### Contents
+
+- [0. How to Complete These Exercises](#0-how-to-complete-these-exercises)
+- [1. Reading Docs and CHANGELOGs](#1-reading-docs-and-changelogs)
+- [2. `cargo add`, Feature Flags, and the Tree](#2-cargo-add-feature-flags-and-the-tree)
+- [3. Errors Across Crate Boundaries](#3-errors-across-crate-boundaries)
+- [4. Benchmarking with Criterion](#4-benchmarking-with-criterion)
+- [5. Structuring a Small Multi-Module Service](#5-structuring-a-small-multi-module-service)
+- [6. Choosing the Capstone Scope](#6-choosing-the-capstone-scope)
+- [7. Reading the Compiler: E-Codes](#7-reading-the-compiler-e-codes)
+- [8. Mixed Review](#8-mixed-review)
+- [9. What Comes Next](#9-what-comes-next)
+
+§1–§5 and §7 each have exercises for the runnable cells of the example notebook; §6 is the scope table; §8 mixes corners.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 0. How to Complete These Exercises
+
+This notebook runs on the same **evcxr** kernel as the example notebook. Three consequences shape how you work:
+
+1. **No `fn main`.** The body of a cell *is* the body of `main`. Type statements directly.
+2. **State persists.** A binding from an earlier cell is visible in every cell below it — including `use` lines.
+3. **Items are order-independent.** A struct or fn may be used above the cell that defines it.
+
+> **Item names must be unique across the whole notebook.** Every cell shares one namespace; two functions with the same name are a redefinition error even in different sections. The same rule covers `use` lines: the first cell that needs a name is the one that imports; later cells rely on persistence — a repeated `use` is E0252. And a trailing `//` comment after a `use` line's semicolon hides that semicolon from the tooling — put the comment on its own line above.
+
+### The stub convention
+
+Each exercise cell declares signatures with contract doc comments and a `// --- check (do not modify) ---` block of asserts. The body you must fill in is `todo!()`, which compiles but **panics** when executed. Replace it and re-run; an `Exercise N.M passed` line means you are done.
+
+### Expect warnings until you finish
+
+Three warning families are normal and self-cleaning:
+
+- `unused variable` — every unsolved stub whose parameters are untouched;
+- `unused import` — the `use` lines serving a stub you have not solved yet;
+- **stub-induced dead code** (`never used` / `never constructed`) — given helpers that only a *solution* calls.
+
+No stub takes a `mut` binding parameter; registries are built and passed by reference.
+
+### One caveat specific to this chapter
+
+The example notebook's §4.1 times the pricing kernels with `Instant` — indicative only. **Never assert a wall-clock number in a check**: timings vary between runs and machines. The exercises here parse *recorded* receipts (a criterion line, a baseline pair) into decisions instead — the same numbers, made deterministic by being data.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 1. Reading Docs and CHANGELOGs
+
+Three artifacts before a crate enters the manifest: the docs.rs feature panel, the CHANGELOG between your pin and your tutorial's version, and the registry source path itself.
+
+**See**: §1 of the example notebook.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 1.1 The artifact route: crate name -> registry path -> newest version.
+
+/// Build the registry source path for `crate_name` at version "0.8.2":
+/// `$CARGO_HOME/registry/src/<hash>/<name>-<version>`. Use the literal
+/// hash root `registry/src/index.crates.io-1949cf8c6b5b557f` and join
+/// with forward slashes.
+fn artifact_path(crate_name: &str) -> String {
+    todo!()
+}
+
+/// Parse the NEWEST version heading from a CHANGELOG's text: the first
+/// line starting with "## [" — return the version between the brackets.
+/// Return "?" when no release heading exists.
+fn latest_version(changelog: &str) -> String {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let p = artifact_path("criterion");
+assert!(p.starts_with("registry/src/index.crates.io-1949cf8c6b5b557f/"),
+    "the registry cache root, hash and all: {}", p);
+assert!(p.ends_with("criterion-0.8.2"), "crate name fused with its version: {}", p);
+let cl = "# Changelog\n\n## [Unreleased]\n\n## [0.8.2](https://example/c0.8.1...c0.8.2) - 2026-02-04\n\n### Fixed\n\n## [0.8.1](https://example/c0.8.0...c0.8.1) - 2025-11-30\n";
+assert_eq!(latest_version(cl), "0.8.2", "the newest release heading wins — Unreleased is skipped");
+assert_eq!(latest_version("# Changelog\n\n## [Unreleased]\nnothing yet\n"), "?",
+    "no release heading, no version");
+println!("Exercise 1.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 2. `cargo add`, Feature Flags, and the Tree
+
+`--dry-run` prints the whole flag surface — `+` enabled, `-` available — then aborts; `Cargo.lock` pins what a caret requirement resolved; `cargo tree` draws the graph those choices produced.
+
+**See**: §2 of the example notebook.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 2.1 The feature budget, as data.
+
+/// Count the ENABLED (`+`) and AVAILABLE (`-`) features in a `cargo add
+/// --dry-run` feature listing (one flag per line). Return (enabled, available).
+fn count_flags(listing: &str) -> (usize, usize) {
+    todo!()
+}
+
+/// A caret requirement resolves to a range: "0.8" allows >=0.8.0, <0.9.0.
+/// Return the range as "low..high" with .0s filled in.
+fn caret_range(req: &str) -> String {
+    let parts: Vec<u32> = req.split('.').map(|p| p.parse().unwrap()).collect();
+    let mut low = parts.clone();
+    while low.len() < 3 {
+        low.push(0);
+    }
+    let mut high = parts.clone();
+    while high.len() < 3 {
+        high.push(0);
+    }
+    high[1] += 1;
+    high[2] = 0;
+    format!("{}.{:02}.{}..{}.{:02}.{}",
+        low[0], low[1], low[2], high[0], high[1], high[2])
+}
+
+/// The commit decision: lockfile committed -> true. The argument is the
+/// manifest's note about reproducibility; the desk pins, so return
+/// whether `note` contains "reproducible".
+fn commit_lock(note: &str) -> bool {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let listing = "    + derive\n    - alloc\n    - rc\n    - unstable\n";
+assert_eq!(count_flags(listing), (1, 3));
+assert_eq!(count_flags(""), (0, 0));
+assert_eq!(caret_range("0.8"), "0.08.0..0.09.0", "the range '0.8' allows: 0.8.0 <= v < 0.9.0");
+assert_eq!(caret_range("1"), "1.00.0..1.01.0");
+assert_eq!(commit_lock("pinned for reproducible benches"), true);
+assert_eq!(commit_lock("niche"), false);
+println!("Exercise 2.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 3. Errors Across Crate Boundaries
+
+One domain error per service, `From` at each boundary, `?` everywhere else — and at the very end, one façade converting to an exit code (chapter 11's `main() -> Result` contract, in int form).
+
+**See**: §3 of the example notebook.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 3.1 The two-crate pipeline: convert at the boundary, name the layer,
+// exit with a code.
+// Given: the crate errors, the domain error, and the From impls — do not
+// modify. This is §3.1 of the example notebook, minus the prose.
+#[derive(Debug, PartialEq)]
+enum FeedErr {
+    Timeout,
+    Status(u16),
+}
+
+#[derive(Debug, PartialEq)]
+enum CacheErr {
+    Down,
+}
+
+#[derive(Debug, PartialEq)]
+enum ServiceError {
+    Feed(String),
+    Cache(String),
+}
+
+impl std::fmt::Display for ServiceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ServiceError::Feed(m) => write!(f, "feed: {m}"),
+            ServiceError::Cache(m) => write!(f, "cache: {m}"),
+        }
+    }
+}
+
+impl From<FeedErr> for ServiceError {
+    fn from(e: FeedErr) -> Self {
+        match e {
+            FeedErr::Timeout => ServiceError::Feed("timeout".to_string()),
+            FeedErr::Status(c) => ServiceError::Feed(format!("status {c}")),
+        }
+    }
+}
+
+impl From<CacheErr> for ServiceError {
+    fn from(e: CacheErr) -> Self {
+        let _ = e;
+        ServiceError::Cache("down".to_string())
+    }
+}
+
+// the "crates": stub clients with the real shapes
+struct Feed;
+impl Feed {
+    fn get(&self, sym: &str) -> Result<i64, FeedErr> {
+        if sym == "BAD" {
+            Err(FeedErr::Status(404))
+        } else if sym == "SLOW" {
+            Err(FeedErr::Timeout)
+        } else {
+            Ok(42)
+        }
+    }
+}
+
+struct Cache {
+    down: bool,
+    rows: std::collections::HashMap<String, i64>,
+}
+impl Cache {
+    fn get(&self, sym: &str) -> Result<Option<i64>, CacheErr> {
+        if self.down {
+            Err(CacheErr::Down)
+        } else {
+            Ok(self.rows.get(sym).copied())
+        }
+    }
+    fn put(&mut self, sym: &str, px: i64) -> Result<(), CacheErr> {
+        if self.down {
+            Err(CacheErr::Down)
+        } else {
+            self.rows.insert(sym.to_string(), px);
+            Ok(())
+        }
+    }
+}
+
+/// The cache-aside pipeline with `?` at every hop: check the cache, on a
+/// miss fetch from the feed, store, return. All failures surface as
+/// ServiceError through the From impls.
+fn best_price(cache: &mut Cache, sym: &str) -> Result<i64, ServiceError> {
+    todo!()
+}
+
+/// The layer that failed, as data: "feed" or "cache" (the Display
+/// discipline, machine-readable).
+fn boundary_of(e: &ServiceError) -> &'static str {
+    todo!()
+}
+
+/// The façade's exit contract (chapter 11's main() -> Result, as an int):
+/// Ok -> 0, Err -> 1.
+fn exit_code(r: Result<i64, ServiceError>) -> i32 {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let mut cache = Cache { down: false, rows: std::collections::HashMap::new() };
+assert_eq!(best_price(&mut cache, "AAA"), Ok(42));
+assert_eq!(best_price(&mut cache, "AAA"), Ok(42), "second read hits the cache");
+assert_eq!(cache.rows.len(), 1, "the miss was stored");
+let e = best_price(&mut cache, "BAD").unwrap_err();
+assert_eq!(e.to_string(), "feed: status 404");
+assert_eq!(boundary_of(&e), "feed");
+let mut down = Cache { down: true, rows: std::collections::HashMap::new() };
+let e = best_price(&mut down, "AAA").unwrap_err();
+assert_eq!(e.to_string(), "cache: down");
+assert_eq!(boundary_of(&e), "cache");
+assert_eq!(exit_code(Ok(42)), 0);
+assert_eq!(exit_code(Err(e)), 1);
+println!("Exercise 3.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 4. Benchmarking with Criterion
+
+The desk's receipts as decisions: parse a criterion interval line and a baseline pair, and apply the workflow rules (correctness first, black_box, `-- --test` in CI).
+
+**See**: §4 of the example notebook.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 4.1 The receipts, as decisions.
+
+/// Parse a criterion interval "[146.61 ns 148.61 ns 151.31 ns]" into the
+/// (low, estimate, high) trio in ns.
+fn parse_interval(line: &str) -> (f64, f64, f64) {
+    todo!()
+}
+
+/// The regression gate: does the candidate interval's LOW exceed the
+/// baseline's HIGH? (criterion's `--baseline` decision, simplified.)
+fn regressed(baseline: (f64, f64, f64), candidate: (f64, f64, f64)) -> bool {
+    todo!()
+}
+
+/// The CI budget decision: `cargo bench -- --test` runs each bench once —
+/// return how many "samples" that mode collects (the example notebook's
+/// receipt says: one run per bench, printed as `Testing desk/slow`).
+fn ci_samples() -> usize {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let base = parse_interval("[146.61 ns 148.61 ns 151.31 ns]");
+assert_eq!(base, (146.61, 148.61, 151.31));
+let cand = parse_interval("[82.647 ns 83.181 ns 83.765 ns]");
+assert_eq!(cand, (82.647, 83.181, 83.765));
+assert_eq!(regressed(base, cand), false, "candidate is FASTER — no regression");
+let worse = parse_interval("[170.0 ns 175.0 ns 190.0 ns]");
+assert_eq!(regressed(base, worse), true, "candidate low above baseline high: regressed");
+assert_eq!(regressed(cand, base), true, "direction matters");
+assert_eq!(ci_samples(), 1, "the --test mode runs each bench exactly once");
+println!("Exercise 4.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 5. Structuring a Small Multi-Module Service
+
+One job per module, dependencies point inward, one façade owns shutdown and the error exit.
+
+**See**: §5 of the example notebook.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 5.1 The inventory as data: modules -> jobs, and the dependency audit.
+// Given: the §5.1 miniature's inventory (kernel/feed/cache), re-declared
+// as a fn so both notebooks' shapes stay in lockstep — do not modify.
+#[derive(Debug, PartialEq)]
+enum Job {
+    Pure,
+    Boundary,
+}
+
+fn inventory() -> std::collections::HashMap<&'static str, Job> {
+    std::collections::HashMap::from([
+        ("kernel", Job::Pure),
+        ("feed", Job::Boundary),
+        ("cache", Job::Boundary),
+    ])
+}
+
+/// The inventory rule, checked: return the number of modules whose job is
+/// Pure — the capstone's benchmarkable core. (§4 benches exactly these.)
+fn pure_count(inv: &std::collections::HashMap<&'static str, Job>) -> usize {
+    todo!()
+}
+
+/// The audit: a module list is healthy when every name is in the
+/// inventory. Return Ok(()) or Err listing the unknown module.
+fn audit(names: &[&str]) -> Result<(), String> {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let inv = inventory();
+assert_eq!(pure_count(&inv), 1, "kernel is the one pure module — the bench target");
+assert_eq!(audit(&["kernel", "feed", "cache"]), Ok(()));
+assert_eq!(audit(&["kernel", "auth"]), Err("auth".to_string()),
+    "an unknown module is either new scope (defer it, §6) or a second job hiding in one module");
+println!("Exercise 5.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 6. Choosing the Capstone Scope
+
+The checklist is subtraction: does the item exercise a chapter's skill, and does it fit the build budget?
+
+**See**: §6 of the example notebook.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 6.1 The scope sieve.
+
+/// Classify a scope item: "in" when it names a chapter skill ("layout",
+/// "bench", "errors", "tests"), "defer" when it is new scope ("tls",
+/// "auth", "metrics", "distributed"), else "?" — and the §6 rule for
+/// already-covered skills: "logging" is chapter 09's, so "defer".
+fn scope(item: &str) -> &'static str {
+    todo!()
+}
+
+// --- check (do not modify) ---
+assert_eq!(scope("layout"), "in");
+assert_eq!(scope("bench"), "in");
+assert_eq!(scope("errors"), "in");
+assert_eq!(scope("tests"), "in");
+assert_eq!(scope("tls"), "defer");
+assert_eq!(scope("auth"), "defer");
+assert_eq!(scope("metrics"), "defer");
+assert_eq!(scope("distributed"), "defer");
+assert_eq!(scope("logging"), "defer", "chapter 09 owns logging — already covered elsewhere");
+assert_eq!(scope("docs"), "?", "not in either list: the sieve says ask, not guess");
+println!("Exercise 6.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 7. Reading the Compiler: E-Codes
+
+The multi-crate diagnostics: E0432/E0599 as feature-flag stories, and the bench-unit visibility rule.
+
+**See**: §7 of the example notebook.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 7.1 The feature-flag story, as decisions.
+
+/// A method failed with E0599 (or E0432 on the module path) and the crate
+/// is installed: what do you check FIRST? Return the doc artifact: the
+/// "flags" panel or the "changelog" — the example notebook's §1 order.
+fn first_check() -> &'static str {
+    todo!()
+}
+
+/// The bench-visibility rule: a type used in benches/ must be what, in
+/// lib.rs? Return "pub" or "private".
+fn bench_visibility() -> &'static str {
+    todo!()
+}
+
+// --- check (do not modify) ---
+assert_eq!(first_check(), "flags");
+assert_eq!(bench_visibility(), "pub");
+println!("Exercise 7.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 8. Mixed Review
+
+Four problems, each from a different corner of the chapter.
+
+**See**: §1–§2 of the example notebook (8.1), §3 and §5 (8.2), §4 (8.3), §2 and §6 (8.4).
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 8.1 The vendor check, end to end.
+
+/// Decode a semver triple: return (major, minor, patch) — 0 minors are
+/// pre-1.0 (SemVer's leftmost-nonzero rule) and a bumped minor CAN break.
+fn semver(v: &str) -> (u64, u64, u64) {
+    todo!()
+}
+
+/// The vendor decision: "pin" when the crate is pre-1.0 (minor bumps can
+/// break), else "track" (caret is fine).
+fn pin_or_track(v: &str) -> &'static str {
+    todo!()
+}
+
+// --- check (do not modify) ---
+assert_eq!(semver("0.8.2"), (0, 8, 2));
+assert_eq!(semver("1.0.229"), (1, 0, 229));
+assert_eq!(pin_or_track("0.8.2"), "pin", "0.8 -> 0.9 can break: criterion is pinned");
+assert_eq!(pin_or_track("1.0.229"), "track", "1.x minor bumps are additive: serde tracks");
+println!("Exercise 8.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 8.2 The service in one function: inventory + pipeline + exit code.
+
+/// The health check a team actually runs: pipeline the symbol; on error,
+/// report (boundary, exit code). Return ("ok", 0) on success.
+fn health(cache: &mut Cache, sym: &str) -> (&'static str, i32) {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let mut cache = Cache { down: false, rows: std::collections::HashMap::new() };
+assert_eq!(health(&mut cache, "AAA"), ("ok", 0));
+let mut down = Cache { down: true, rows: std::collections::HashMap::new() };
+assert_eq!(health(&mut down, "AAA"), ("cache", 1), "the layer and the exit, machine-readable");
+println!("Exercise 8.2 passed");
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 8.3 The bench plan: correctness gate, input pinning, CI mode.
+
+/// Order the workflow: return the list of steps in order —
+/// ["equiv", "black_box", "bench", "baseline"] (assert equivalence,
+/// pin the input, run the bench, save the baseline).
+fn bench_plan() -> Vec<&'static str> {
+    todo!()
+}
+
+/// The bench target: which module does §4 benchmark? (§5.1's inventory
+/// answers it.)
+fn bench_target() -> &'static str {
+    todo!()
+}
+
+// --- check (do not modify) ---
+assert_eq!(bench_plan(), vec!["equiv", "black_box", "bench", "baseline"]);
+assert_eq!(bench_target(), "kernel", "the pure module — the only thing a bench may time honestly");
+println!("Exercise 8.3 passed");
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 8.4 The regression report: two runs, one decision.
+
+/// Compare a baseline and candidate interval pair: return "faster",
+/// "within", or "regressed" — candidate high below baseline low is
+/// "faster"; candidate low above baseline high is "regressed";
+/// overlapping intervals are "within".
+fn verdict(baseline: (f64, f64, f64), candidate: (f64, f64, f64)) -> &'static str {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let base = parse_interval("[146.61 ns 148.61 ns 151.31 ns]");
+let fast = parse_interval("[82.647 ns 83.181 ns 83.765 ns]");
+let slow = parse_interval("[170.0 ns 175.0 ns 190.0 ns]");
+let same = parse_interval("[147.0 ns 149.0 ns 151.0 ns]");
+assert_eq!(verdict(base, fast), "faster", "83 ns vs 148 ns: no overlap at all");
+assert_eq!(verdict(base, slow), "regressed");
+assert_eq!(verdict(base, same), "within", "overlap: 147 > 146.61 and 151 < 151.31");
+println!("Exercise 8.4 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 9. What Comes Next
+
+| Next | What it borrows from here |
+|---|---|
+| **22 — Capstone** | §5's layout is the skeleton you start from, §3's `ServiceError` the spine, §4's baseline the regression gate, §6's sieve the conscience when scope creep knocks. |
+
+Carry forward: **read the flags, pin the lock, convert at the boundary, measure with baselines, one job per module, one façade for shutdown — then assemble.**
+</VSCode.Cell>

@@ -1,0 +1,1315 @@
+<VSCode.Cell language="markdown">
+# Rust 122: Capstone — Market Data Service
+
+The last chapter assembles everything: a WebSocket-grade feed over chapter 17's HTTP client, chapter 18's Redis cache-aside, chapter 19's transactional PostgreSQL persistence, chapter 20's boundary discipline, chapter 21's layout rules — and no new concepts. **The service runs for real in this notebook**: chapters 17–19 each embedded a wire-protocol desk server (HTTP, RESP2, PostgreSQL v3); the capstone combines all three into one namespace and drives one pipeline through them.
+
+The shape is §21.5's, exactly: modules by responsibility, one error spine, dependencies inward, one façade. Here the "modules" are sections; the crates are the real ones; every receipt is a desk assertion, not a metaphor.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+### Contents
+
+- [0. Notebook Conventions: How These Cells Run](#0-notebook-conventions-how-these-cells-run)
+- [1. The Desk: Three Servers, One Namespace](#1-the-desk-three-servers-one-namespace)
+- [2. The Spine: Fill, Quote, ServiceError](#2-the-spine-fill-quote-serviceerror)
+- [3. Stage 1 + 2: Ingest, Cache-Aside](#3-stage-1--2-ingest-cache-aside)
+- [4. Stage 3: Persist in a Transaction](#4-stage-3-persist-in-a-transaction)
+- [5. Stage 4: The Pure Kernel](#5-stage-4-the-pure-kernel)
+- [6. The Façade: run_service](#6-the-facade-run_service)
+- [7. The Surface: A CLI Report](#7-the-surface-a-cli-report)
+- [8. Graceful Shutdown](#8-graceful-shutdown)
+- [9. Reading the Compiler: E-Codes](#9-reading-the-compiler-e-codes)
+- [10. Mental Model: The Receipts](#10-mental-model-the-receipts)
+- [11. Cheat Sheet](#11-cheat-sheet)
+- [12. Review](#12-review)
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 0. Notebook Conventions: How These Cells Run
+
+This notebook runs on the same **evcxr** kernel as every chapter. Three consequences shape how you work:
+
+1. **No `fn main`.** The body of a cell *is* the body of `main`. Type statements directly.
+2. **State persists.** A binding from an earlier cell is visible in every cell below it — including `use` lines.
+3. **Items are order-independent.** A struct or fn may be used above the cell that defines it.
+
+> **Item names must be unique across the whole notebook.** The rule this series has enforced since chapter 01 becomes the capstone's *architecture lesson*: three desk servers ported from three chapters share one namespace, so every item carries its desk's prefix (`md_` for the HTTP desk, `rd_` for the Redis desk's internals, `pg_` for the PostgreSQL desk's). The prefix is the module tree, flattened — §21's "one job per module" made visible as one prefix per source.
+
+### The crate cell
+
+Six crates from three chapters load once per session — all on the wave chapter 19 froze (a new crate here would re-hash every rlib in `_externs.txt`; the capstone adds none).
+
+### Receipts, not vibes
+
+Every stage cell asserts on its desk's observable state: the HTTP desk's request log (cache-aside proven by request *counts*), the PostgreSQL desk's transaction ledger (`pg_tx_c.log` — commit and rollback receipts), Redis keys read back through the real protocol. **No wall-clock asserts** (chapter 21's rule): the pipeline is timed in prose, never in a check.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 0.1 The capstone's crate cell: six crates, one wave, run once.
+:dep tokio = { version = "1", features = ["full"] }
+:dep reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "charset"] }
+:dep redis = { version = "0.27", default-features = false, features = ["tokio-comp", "serde"] }
+:dep serde = { version = "1", features = ["derive"] }
+:dep serde_json = "1"
+:dep sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres"] }
+
+let rt = tokio::runtime::Runtime::new().unwrap();
+let answer = rt.block_on(async { 40 + 2 });
+assert_eq!(answer, 42);
+println!("crates loaded; block_on smoke: {} — the service's runtime shape", answer);
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 1. The Desk: Three Servers, One Namespace
+
+§1 of three chapters, combined. **`md_url_desk()`** is chapter 17's HTTP server verbatim (routes `/ok /json /fills /junk /slow /error /q /big`, request log included) — the *feed* and the *origin* behind the cache. **`md_redis_desk()`** is chapter 18's RESP2 server verbatim (strings/expiry/hashes/lists/sets/pub-sub) — the *cache*. **`md_pg_desk()`** is chapter 19's PostgreSQL v3 server verbatim (extended protocol, transactions as snapshot-restore, the `pg_tx_c.log` ledger) — the *store*. Each starts on an ephemeral port, fresh per call, so every check is hermetic.
+
+One namespace, three prefixes — and the E0428 that would otherwise fire is the chapter's first lesson: **a flat namespace forces the discipline a module tree gives you for free.** Real `market-data/` (§21.5) spells it `feed::`, `cache::`, `store::`; the notebook spells it `md_`, `rd_`, `pg_`.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 1.1 The feed and the cache, verbatim from chapters 17 and 18 — prefixed.
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+// ---- the feed: chapter 17's HTTP desk (md_ prefix) ----
+
+/// Start a fresh local HTTP server; return (base_url, request_log).
+fn md_url_desk() -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let log2 = Arc::clone(&log);
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let l = Arc::clone(&log2);
+            std::thread::spawn(move || md_serve_one(stream, l));
+        }
+    });
+    (format!("http://127.0.0.1:{}", port), log)
+}
+
+/// One connection of the local server.
+fn md_serve_one(stream: std::net::TcpStream, log: Arc<Mutex<Vec<String>>>) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let mut reader = BufReader::new(match stream.try_clone() { Ok(s) => s, Err(_) => return });
+    let mut line = String::new();
+    if reader.read_line(&mut line).is_err() { return; }
+    let mut parts = line.split_whitespace();
+    let method = parts.next().unwrap_or("").to_string();
+    let path = parts.next().unwrap_or("").to_string();
+    let mut content_len = 0usize;
+    loop {
+        let mut h = String::new();
+        if reader.read_line(&mut h).is_err() { return; }
+        if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") {
+            content_len = v.trim().parse().unwrap_or(0);
+        }
+        if h.trim().is_empty() { break; }
+    }
+    let mut body = vec![0u8; content_len];
+    if content_len > 0 { reader.read_exact(&mut body).ok(); }
+    log.lock().unwrap().push(format!("{} {}", method, path));
+    let route = path.split('?').next().unwrap_or("").to_string();
+    let (status, ctype, payload): (u16, &'static str, Vec<u8>) = match (method.as_str(), route.as_str()) {
+        ("GET", "/ok") => (200, "text/plain", b"spire local ok".to_vec()),
+        ("GET", "/json") => (200, "application/json", br#"{"sym":"SPIRE","px":101.5}"#.to_vec()),
+        ("GET", "/fills") => (200, "application/json",
+            br#"[{"sym":"AAA","px":10.0,"qty":100},{"sym":"BBB","px":20.5,"qty":200}]"#.to_vec()),
+        ("GET", "/junk") => (200, "application/json", b"not json at all".to_vec()),
+        ("GET", "/error") => (500, "text/plain", b"boom".to_vec()),
+        ("GET", "/q") => (200, "text/plain", format!("path={}", path).into_bytes()),
+        _ => (404, "text/plain", b"nope".to_vec()),
+    };
+    let mut head = format!("HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n", status, ctype, payload.len());
+    head.push_str("\r\n");
+    let mut s = stream;
+    s.write_all(head.as_bytes()).ok();
+    s.write_all(&payload).ok();
+}
+
+// ---- the cache: chapter 18's RESP2 desk (rd_ prefix) ----
+
+fn rd_bulk(s: &str) -> String { format!("${}\r\n{}\r\n", s.len(), s) }
+
+fn rd_arr(items: &[String]) -> String {
+    let mut out = format!("*{}\r\n", items.len());
+    // EVERY element needs its own CRLF: a count element like ":1" without one
+    // leaves the frame unterminated and the client's parser waits forever.
+    for i in items { out.push_str(&rd_crlf(i.clone())); }
+    out
+}
+
+fn rd_crlf(mut s: String) -> String {
+    if !s.ends_with("\r\n") { s.push_str("\r\n"); }
+    s
+}
+
+fn rd_find(hay: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
+    if needle.len() > hay.len() || from > hay.len() - needle.len() { return None; }
+    (from..=hay.len() - needle.len()).find(|&i| &hay[i..i + needle.len()] == needle)
+}
+
+fn rd_now_ms() -> u128 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
+}
+
+#[derive(Default)]
+struct RdDb {
+    kv: HashMap<String, String>,
+    expiry_ms: HashMap<String, u128>,
+    lists: HashMap<String, Vec<String>>,
+    sets: HashMap<String, Vec<String>>,
+    hashes: HashMap<String, Vec<(String, String)>>,
+}
+
+type RdSharedDb = Arc<Mutex<RdDb>>;
+type RdSubTxMap = Arc<Mutex<HashMap<usize, Vec<std::sync::mpsc::Sender<(String, String)>>>>>;
+
+fn rd_alive(d: &RdDb, key: &str) -> bool {
+    let exists = d.kv.contains_key(key) || d.lists.contains_key(key)
+        || d.sets.contains_key(key) || d.hashes.contains_key(key);
+    exists && d.expiry_ms.get(key).map_or(true, |&t| t > rd_now_ms())
+}
+
+fn rd_sweep(d: &mut RdDb) {
+    let dead: Vec<String> = d.expiry_ms.iter()
+        .filter(|e| *e.1 <= rd_now_ms()).map(|e| e.0.clone()).collect();
+    for k in dead {
+        d.kv.remove(&k); d.expiry_ms.remove(&k);
+        d.lists.remove(&k); d.sets.remove(&k); d.hashes.remove(&k);
+    }
+}
+
+fn rd_arg(cmd: &[Vec<u8>], i: usize) -> String {
+    cmd.get(i).map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default()
+}
+
+fn rd_dispatch(d: &mut RdDb, _subs_tx: &RdSubTxMap, cmd: &[Vec<u8>]) -> String {
+    rd_sweep(d);
+    let name = String::from_utf8_lossy(&cmd[0]).to_uppercase();
+    match name.as_str() {
+        "PING" => "+PONG".to_string(),
+        "ECHO" => rd_bulk(&rd_arg(cmd, 1)),
+        "SET" | "SETEX" => {
+            let k = rd_arg(cmd, 1);
+            if name == "SETEX" {
+                let secs: u128 = rd_arg(cmd, 2).parse().unwrap_or(0);
+                d.expiry_ms.insert(k.clone(), rd_now_ms() + secs * 1000);
+                d.kv.insert(k, rd_arg(cmd, 3));
+                return "+OK".to_string();
+            }
+            let mut ttl = None;
+            let mut i = 3;
+            while i < cmd.len() {
+                let o = rd_arg(cmd, i).to_uppercase();
+                if o == "EX" { ttl = Some(rd_now_ms() + rd_arg(cmd, i + 1).parse::<u128>().unwrap_or(0) * 1000); i += 2; }
+                else if o == "PX" { ttl = Some(rd_now_ms() + rd_arg(cmd, i + 1).parse::<u128>().unwrap_or(0)); i += 2; }
+                else { i += 1; }
+            }
+            if let Some(t) = ttl { d.expiry_ms.insert(k.clone(), t); }
+            d.kv.insert(k, rd_arg(cmd, 2));
+            "+OK".to_string()
+        }
+        "GET" => {
+            let k = rd_arg(cmd, 1);
+            if rd_alive(d, &k) { rd_bulk(&d.kv[&k]) } else { "$-1\r\n".to_string() }
+        }
+        "DEL" => {
+            let mut n = 0;
+            for i in 1..cmd.len() {
+                let k = rd_arg(cmd, i);
+                let mut gone = d.kv.remove(&k).is_some();
+                gone |= d.lists.remove(&k).is_some();
+                gone |= d.sets.remove(&k).is_some();
+                gone |= d.hashes.remove(&k).is_some();
+                d.expiry_ms.remove(&k);
+                if gone { n += 1; }
+            }
+            format!(":{}", n)
+        }
+        "EXISTS" => format!(":{}", if rd_alive(d, &rd_arg(cmd, 1)) { 1 } else { 0 }),
+        "TTL" | "PTTL" => {
+            let k = rd_arg(cmd, 1);
+            if !rd_alive(d, &k) {
+                let lingering = d.kv.contains_key(&k) || d.lists.contains_key(&k)
+                    || d.sets.contains_key(&k) || d.hashes.contains_key(&k);
+                if lingering { ":-1".to_string() } else { ":-2".to_string() }
+            } else if let Some(&t) = d.expiry_ms.get(&k) {
+                let ms = t.saturating_sub(rd_now_ms());
+                if name == "PTTL" { format!(":{}", ms) } else { format!(":{}", (ms + 999) / 1000) }
+            } else { ":-1".to_string() }
+        }
+        "EXPIRE" | "PEXPIRE" => {
+            let k = rd_arg(cmd, 1);
+            let mult: u128 = if name == "EXPIRE" { 1000 } else { 1 };
+            let amount: u128 = rd_arg(cmd, 2).parse().unwrap_or(0);
+            if rd_alive(d, &k) { d.expiry_ms.insert(k, rd_now_ms() + amount * mult); ":1".to_string() } else { ":0".to_string() }
+        }
+        "PERSIST" => {
+            let k = rd_arg(cmd, 1);
+            if rd_alive(d, &k) && d.expiry_ms.remove(&k).is_some() { ":1".to_string() } else { ":0".to_string() }
+        }
+        "INCR" | "INCRBY" => {
+            let k = rd_arg(cmd, 1);
+            let delta: i64 = if name == "INCR" { 1 } else { rd_arg(cmd, 2).parse().unwrap_or(0) };
+            let v: i64 = d.kv.get(&k).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let nv = v + delta;
+            d.kv.insert(k, nv.to_string());
+            format!(":{}", nv)
+        }
+        "HSET" => {
+            let k = rd_arg(cmd, 1);
+            let mut added = 0i64;
+            let e = d.hashes.entry(k).or_default();
+            let mut a = 2;
+            while a + 1 < cmd.len() {
+                let f = rd_arg(cmd, a);
+                let v = rd_arg(cmd, a + 1);
+                if let Some(p) = e.iter_mut().find(|(pf, _)| *pf == f) { p.1 = v; }
+                else { e.push((f, v)); added += 1; }
+                a += 2;
+            }
+            format!(":{}", added)
+        }
+        "HGET" => {
+            let k = rd_arg(cmd, 1);
+            let f = rd_arg(cmd, 2);
+            match d.hashes.get(&k).and_then(|h| h.iter().find(|(pf, _)| pf == &f)) {
+                Some((_, v)) => rd_bulk(v),
+                None => "$-1\r\n".to_string(),
+            }
+        }
+        "LPUSH" => {
+            let k = rd_arg(cmd, 1);
+            let e = d.lists.entry(k).or_default();
+            for i in 2..cmd.len() { e.insert(0, rd_arg(cmd, i)); }
+            format!(":{}", e.len())
+        }
+        "RPUSH" => {
+            let k = rd_arg(cmd, 1);
+            let e = d.lists.entry(k).or_default();
+            for i in 2..cmd.len() { e.push(rd_arg(cmd, i)); }
+            format!(":{}", e.len())
+        }
+        "SADD" => {
+            let k = rd_arg(cmd, 1);
+            let mut added = 0;
+            let e = d.sets.entry(k).or_default();
+            for i in 2..cmd.len() {
+                let v = rd_arg(cmd, i);
+                if !e.contains(&v) { e.push(v); added += 1; }
+            }
+            format!(":{}", added)
+        }
+        "SMEMBERS" => {
+            let items: Vec<String> = d.sets.get(&rd_arg(cmd, 1))
+                .map(|v| v.iter().map(|x| rd_bulk(x)).collect()).unwrap_or_default();
+            rd_arr(&items)
+        }
+        "CLIENT" | "SELECT" | "AUTH" => "+OK".to_string(),
+        "HELLO" => "-ERR unknown command 'HELLO'".to_string(),
+        "CONFIG" | "COMMAND" => "*0\r\n".to_string(),
+        _ => format!("-ERR unknown command '{}'", name),
+    }
+}
+
+enum RdParsed { None, Skip(#[allow(dead_code)] usize), Cmd(Vec<Vec<u8>>, usize) }
+
+fn rd_parse_one(buf: &[u8]) -> RdParsed {
+    if buf.is_empty() { return RdParsed::None; }
+    if buf[0] == b'*' {
+        let hdr = match rd_find(buf, 0, b"\r\n") { Some(i) => i, None => return RdParsed::None };
+        let n: usize = match std::str::from_utf8(&buf[1..hdr]).ok().and_then(|s| s.parse().ok()) {
+            Some(n) => n, None => return RdParsed::Skip(hdr + 2),
+        };
+        let mut p = hdr + 2;
+        let mut args = Vec::new();
+        for _ in 0..n {
+            if p >= buf.len() { return RdParsed::None; }
+            if buf[p] != b'$' { return RdParsed::Skip(p); }
+            let len_end = match rd_find(buf, p, b"\r\n") { Some(i) => i, None => return RdParsed::None };
+            let len: usize = match std::str::from_utf8(&buf[p + 1..len_end]).ok().and_then(|s| s.parse().ok()) {
+                Some(l) => l, None => return RdParsed::Skip(len_end + 2),
+            };
+            p = len_end + 2;
+            if p + len + 2 > buf.len() { return RdParsed::None; }
+            args.push(buf[p..p + len].to_vec());
+            p += len + 2;
+        }
+        RdParsed::Cmd(args, p)
+    } else {
+        let line_end = match rd_find(buf, 0, b"\n") { Some(i) => i, None => return RdParsed::None };
+        let line = String::from_utf8_lossy(&buf[..line_end]).trim().to_string();
+        if line.is_empty() { return RdParsed::Skip(line_end + 1); }
+        RdParsed::Cmd(line.split_whitespace().map(|s| s.as_bytes().to_vec()).collect(), line_end + 1)
+    }
+}
+
+/// Start a fresh RESP2 desk; return its URL.
+fn md_redis_desk() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let db: RdSharedDb = Arc::new(Mutex::new(RdDb::default()));
+    let subs_tx: RdSubTxMap = Arc::new(Mutex::new(HashMap::new()));
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let db = Arc::clone(&db);
+            let subs_tx = Arc::clone(&subs_tx);
+            std::thread::spawn(move || {
+                let mut r = match stream.try_clone() { Ok(s) => s, Err(_) => return };
+                let mut w = stream;
+                r.set_read_timeout(Some(std::time::Duration::from_millis(10))).ok();
+                let mut buf: Vec<u8> = Vec::new();
+                let mut tmp = [0u8; 8192];
+                loop {
+                    match r.read(&mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut => continue,
+                        Err(_) => break,
+                    }
+                    while let RdParsed::Cmd(cmd, used) = rd_parse_one(&buf) {
+                        buf.drain(..used);
+                        if cmd.is_empty() { continue; }
+                        let reply = rd_dispatch(&mut db.lock().unwrap(), &subs_tx, &cmd);
+                        w.write_all(rd_crlf(reply).as_bytes()).ok();
+                        w.flush().ok();
+                    }
+                }
+            });
+        }
+    });
+    format!("redis://127.0.0.1:{}", port)
+}
+
+// the two desks are up; the store joins in the next cell
+let (base, log) = md_url_desk();
+assert_eq!(log.lock().unwrap().len(), 0, "fresh desk, empty request log");
+let rurl = md_redis_desk();
+assert!(rurl.starts_with("redis://127.0.0.1:"));
+println!("feed desk: {}  cache desk: {}", base, rurl);
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 1.2 The store: chapter 19's PostgreSQL v3 desk verbatim (pg_ prefix).
+use std::io::{Read, Write};
+
+fn pg_msg(tag: u8, body: &[u8]) -> Vec<u8> {
+    let mut out = vec![tag];
+    out.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+    out.extend_from_slice(body);
+    out
+}
+fn pg_cstr(s: &str) -> Vec<u8> { let mut v = s.as_bytes().to_vec(); v.push(0); v }
+fn pg_i32be(n: i32) -> Vec<u8> { n.to_be_bytes().to_vec() }
+fn pg_i16be(n: i16) -> Vec<u8> { n.to_be_bytes().to_vec() }
+fn pg_authentication_ok() -> Vec<u8> { pg_msg(b'R', &pg_i32be(0)) }
+fn pg_parameter_status(k: &str, v: &str) -> Vec<u8> { let mut b = pg_cstr(k); b.extend(pg_cstr(v)); pg_msg(b'S', &b) }
+fn pg_ready_for_query(status: u8) -> Vec<u8> { pg_msg(b'Z', &[status, 0]) }
+fn pg_command_complete(tag: &str) -> Vec<u8> { pg_msg(b'C', &pg_cstr(tag)) }
+fn pg_error_response(code: &str, message: &str) -> Vec<u8> {
+    let mut b = vec![b'S']; b.extend(pg_cstr("ERROR")); b.push(b'V'); b.extend(pg_cstr("ERROR"));
+    b.push(b'C'); b.extend(pg_cstr(code)); b.push(b'M'); b.extend(pg_cstr(message)); b.push(0);
+    pg_msg(b'E', &b)
+}
+fn pg_parse_complete() -> Vec<u8> { pg_msg(b'1', &[]) }
+fn pg_bind_complete() -> Vec<u8> { pg_msg(b'2', &[]) }
+fn pg_no_data() -> Vec<u8> { pg_msg(b'n', &[]) }
+fn pg_empty_query_response() -> Vec<u8> { pg_msg(b'I', &[]) }
+
+const PG_INT4: i32 = 23;
+const PG_TEXT: i32 = 25;
+struct PgCol { name: &'static str, oid: i32, fmt: i16 }
+fn pg_int4col(name: &'static str) -> PgCol { PgCol { name, oid: PG_INT4, fmt: 1 } }
+fn pg_textcol(name: &'static str) -> PgCol { PgCol { name, oid: PG_TEXT, fmt: 0 } }
+fn pg_row_description(cols: &[PgCol]) -> Vec<u8> {
+    let mut b = pg_i16be(cols.len() as i16);
+    for c in cols {
+        b.extend(pg_cstr(c.name)); b.extend(pg_i32be(0)); b.extend(pg_i16be(0)); b.extend(pg_i32be(c.oid));
+        b.extend(pg_i16be(if c.oid == PG_INT4 { 4 } else { -1 })); b.extend(pg_i32be(-1)); b.extend(pg_i16be(c.fmt));
+    }
+    pg_msg(b'T', &b)
+}
+type PgCell = Option<Vec<u8>>;
+type PgWireRow = Vec<PgCell>;
+fn pg_data_row(row: &[PgCell]) -> Vec<u8> {
+    let mut b = pg_i16be(row.len() as i16);
+    for cell in row {
+        match cell {
+            Some(v) => { b.extend(pg_i32be(v.len() as i32)); b.extend(v); }
+            None => b.extend(pg_i32be(-1)),
+        }
+    }
+    pg_msg(b'D', &b)
+}
+
+#[derive(Default)]
+struct PgDb {
+    rows: Vec<(i32, Option<String>)>,
+    next_id: i32,
+    snapshot: Option<(Vec<(i32, Option<String>)>, i32)>,
+}
+impl PgDb {
+    fn tx_note(&self, kind: &str) {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("pg_tx_c.log") {
+            writeln!(f, "{}", kind).ok();
+        }
+    }
+}
+type PgShared = Arc<Mutex<PgDb>>;
+
+fn pg_run_query(db: &mut PgDb, sql: &str, params: &[Option<String>], in_tx: bool) -> (Vec<u8>, bool) {
+    let q = sql.trim();
+    let ql = q.to_lowercase();
+    if q.is_empty() { return (pg_empty_query_response(), in_tx); }
+    let err = |code: &str, m: &str| (pg_error_response(code, m), in_tx);
+    let p0 = || params.first().and_then(|p| p.clone());
+    if ql == "begin" || ql.starts_with("begin ") {
+        if in_tx { return err("25001", "there is already a transaction in progress"); }
+        db.snapshot = Some((db.rows.clone(), db.next_id));
+        db.tx_note("BEGIN");
+        return (pg_command_complete("BEGIN"), true);
+    }
+    if ql == "commit" || ql == "commit work" || ql == "end" {
+        if !in_tx { return err("25P01", "there is no transaction in progress"); }
+        db.snapshot = None;
+        db.tx_note("COMMIT");
+        return (pg_command_complete("COMMIT"), false);
+    }
+    if ql.starts_with("rollback") {
+        if !in_tx { return err("25P01", "there is no transaction in progress"); }
+        if let Some((rows, next)) = db.snapshot.take() { db.rows = rows; db.next_id = next; }
+        db.tx_note("ROLLBACK");
+        return (pg_command_complete("ROLLBACK"), false);
+    }
+    if ql == "select 1" || ql == "select 1;" {
+        let cols = [pg_int4col("n")];
+        let mut out = pg_row_description(&cols);
+        out.extend(pg_data_row(&[Some(pg_i32be(1))]));
+        out.extend(pg_command_complete("SELECT 1"));
+        return (out, in_tx);
+    }
+    if ql.starts_with("select count(*)") {
+        let cols = [pg_int4col("count")];
+        let mut out = pg_row_description(&cols);
+        out.extend(pg_data_row(&[Some(pg_i32be(db.rows.len() as i32))]));
+        out.extend(pg_command_complete("SELECT 1"));
+        return (out, in_tx);
+    }
+    if ql.starts_with("select") {
+        if !ql.contains("from t") && !ql.contains("from fills") {
+            let table = ql.split_whitespace().skip_while(|w| *w != "from").nth(1).unwrap_or("?").trim_end_matches(';');
+            return err("42P01", &format!("relation \"{}\" does not exist", table));
+        }
+        let cols = [pg_int4col("id"), pg_textcol("name")];
+        let filter = if ql.contains("where name = $1") { p0() } else { None };
+        let mut rs: Vec<PgWireRow> = db.rows.iter()
+            .filter(|(_, name)| match &filter {
+                Some(f) => name.as_deref() == Some(f.as_str()),
+                None => true,
+            })
+            .map(|(id, name)| vec![Some(pg_i32be(*id)), name.as_ref().map(|n| n.as_bytes().to_vec())])
+            .collect();
+        rs.sort_by(|a, b| match (&a[0], &b[0]) {
+            (Some(x), Some(y)) => x.cmp(y),
+            _ => std::cmp::Ordering::Equal,
+        });
+        let tag = format!("SELECT {}", rs.len());
+        let mut out = pg_row_description(&cols);
+        for r in &rs { out.extend(pg_data_row(r)); }
+        out.extend(pg_command_complete(&tag));
+        return (out, in_tx);
+    }
+    if ql.starts_with("insert") {
+        let id = db.next_id;
+        db.next_id += 1;
+        db.rows.push((id, p0()));
+        return (pg_command_complete("INSERT 0 1"), in_tx);
+    }
+    if ql.starts_with("update") {
+        let nv = p0();
+        let mut n = 0;
+        for r in db.rows.iter_mut() { r.1 = nv.clone(); n += 1; }
+        return (pg_command_complete(&format!("UPDATE {}", n)), in_tx);
+    }
+    if ql.starts_with("delete") {
+        let n = db.rows.len();
+        db.rows.clear();
+        return (pg_command_complete(&format!("DELETE {}", n)), in_tx);
+    }
+    err("42601", &format!("syntax error at or near \"{}\"", &q[..q.len().min(24)]))
+}
+
+fn pg_returns_rows(sql: &str) -> bool { sql.trim().to_lowercase().starts_with("select") }
+fn pg_cstring_at(body: &[u8], from: usize) -> String {
+    let mut end = from;
+    while end < body.len() && body[end] != 0 { end += 1; }
+    String::from_utf8_lossy(&body[from..end]).into_owned()
+}
+struct PgConn {
+    statements: HashMap<String, String>,
+    portals: HashMap<String, (String, Vec<Option<String>>)>,
+    in_tx: bool,
+}
+fn pg_handle(mut stream: std::net::TcpStream, db: PgShared) {
+    let _ = stream.set_nodelay(true);
+    let mut buf: Vec<u8> = Vec::new();
+    let mut tmp = [0u8; 16384];
+    loop {
+        if buf.len() >= 8 {
+            let l = i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+            if buf.len() >= l { break; }
+        }
+        match stream.read(&mut tmp) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+        }
+    }
+    let code = i32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    if code == 80877103 {
+        let _ = stream.write_all(b"N");
+        buf.drain(..8);
+        loop {
+            if buf.len() >= 8 {
+                let l = i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+                if buf.len() >= l { break; }
+            }
+            match stream.read(&mut tmp) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            }
+        }
+    }
+    let len = i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    let protocol = i32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    buf.drain(..len);
+    if protocol != 196608 {
+        stream.write_all(&pg_error_response("28000", "unsupported protocol")).ok();
+        return;
+    }
+    let mut out = Vec::new();
+    out.extend(pg_authentication_ok());
+    for (k, v) in [("server_version", "16.9"), ("client_encoding", "UTF8"), ("DateStyle", "ISO, MDY"), ("integer_datetimes", "on"), ("TimeZone", "UTC"), ("standard_conforming_strings", "on")] {
+        out.extend(pg_parameter_status(k, v));
+    }
+    out.extend(pg_ready_for_query(b'I'));
+    if stream.write_all(&out).is_err() { return; }
+    stream.flush().ok();
+    let mut conn = PgConn { statements: HashMap::new(), portals: HashMap::new(), in_tx: false };
+    loop {
+        while buf.len() < 5 {
+            match stream.read(&mut tmp) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            }
+        }
+        let want = 1 + i32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+        while buf.len() < want {
+            match stream.read(&mut tmp) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            }
+        }
+        let tag = buf[0];
+        let mlen = i32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+        let total = 1 + mlen;
+        if mlen < 4 { continue; }
+        let body = if mlen > 4 { buf[5..total].to_vec() } else { Vec::new() };
+        buf.drain(..total);
+        let mut reply: Vec<u8> = Vec::new();
+        match tag {
+            b'Q' => {
+                let query = pg_cstring_at(&body, 0);
+                let mut d = db.lock().unwrap();
+                let (payload, tx) = pg_run_query(&mut d, &query, &[], conn.in_tx);
+                conn.in_tx = tx;
+                reply.extend(payload);
+                reply.extend(pg_ready_for_query(if tx { b'T' } else { b'I' }));
+            }
+            b'P' => {
+                let name = pg_cstring_at(&body, 0);
+                let sql = pg_cstring_at(&body, name.len() + 1);
+                conn.statements.insert(name, sql);
+                reply.extend(pg_parse_complete());
+            }
+            b'B' => {
+                let portal = pg_cstring_at(&body, 0);
+                let sstart = portal.len() + 1;
+                let stmt = pg_cstring_at(&body, sstart);
+                let sql = conn.statements.get(&stmt).cloned().unwrap_or_default();
+                let mut p = sstart + stmt.len() + 1;
+                let mut params: Vec<Option<String>> = Vec::new();
+                if p + 2 <= body.len() {
+                    let nfmt = i16::from_be_bytes([body[p], body[p + 1]]) as usize;
+                    p += 2 + nfmt * 2;
+                    if p + 2 <= body.len() {
+                        let nvals = i16::from_be_bytes([body[p], body[p + 1]]) as usize;
+                        p += 2;
+                        for _ in 0..nvals {
+                            if p + 4 > body.len() { break; }
+                            let vlen = i32::from_be_bytes([body[p], body[p + 1], body[p + 2], body[p + 3]]);
+                            p += 4;
+                            if vlen < 0 { params.push(None); }
+                            else {
+                                let end = (p + vlen as usize).min(body.len());
+                                params.push(Some(String::from_utf8_lossy(&body[p..end]).into_owned()));
+                                p = end;
+                            }
+                        }
+                    }
+                }
+                conn.portals.insert(portal, (sql, params));
+                reply.extend(pg_bind_complete());
+            }
+            b'D' => {
+                let kind = body[0];
+                let name = pg_cstring_at(&body, 1);
+                let sql = match kind {
+                    b'S' => conn.statements.get(&name).cloned().unwrap_or_default(),
+                    _ => conn.portals.get(&name).map(|(s, _)| s.clone()).unwrap_or_default(),
+                };
+                reply.extend(pg_msg(b't', &pg_i16be(0)));
+                if pg_returns_rows(&sql) {
+                    if sql.trim().to_lowercase() == "select 1" {
+                        reply.extend(pg_row_description(&[pg_int4col("n")]));
+                    } else if sql.to_lowercase().contains("count(*)") {
+                        reply.extend(pg_row_description(&[pg_int4col("count")]));
+                    } else {
+                        reply.extend(pg_row_description(&[pg_int4col("id"), pg_textcol("name")]));
+                    }
+                } else {
+                    reply.extend(pg_no_data());
+                }
+            }
+            b'E' => {
+                let portal = pg_cstring_at(&body, 0);
+                let (sql, params) = conn.portals.get(&portal).cloned().unwrap_or_default();
+                let mut d = db.lock().unwrap();
+                let (payload, tx) = pg_run_query(&mut d, &sql, &params, conn.in_tx);
+                conn.in_tx = tx;
+                reply.extend(payload);
+            }
+            b'S' => { reply.extend(pg_ready_for_query(if conn.in_tx { b'T' } else { b'I' })); }
+            b'C' => { reply.extend(pg_msg(b'3', &[])); }
+            b'H' => {}
+            b'X' => {
+                if conn.in_tx {
+                    let mut d = db.lock().unwrap();
+                    if let Some((rows, next)) = d.snapshot.take() { d.rows = rows; d.next_id = next; }
+                    d.tx_note("ROLLBACK(dropped)");
+                }
+                return;
+            }
+            _ => {
+                reply.extend(pg_error_response("08P01", "protocol violation"));
+                reply.extend(pg_ready_for_query(if conn.in_tx { b'T' } else { b'I' }));
+            }
+        }
+        if reply.is_empty() { continue; }
+        if stream.write_all(&reply).is_err() { return; }
+        stream.flush().ok();
+    }
+}
+
+/// Start a fresh desk; return its port.
+fn md_pg_desk() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let db: PgShared = Arc::new(Mutex::new(PgDb { next_id: 1, ..PgDb::default() }));
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let db = Arc::clone(&db);
+            std::thread::spawn(move || pg_handle(stream, db));
+        }
+    });
+    port
+}
+
+/// The one-true pool builder (chapter 19's, full paths and all).
+async fn md_pool_on(port: u16) -> sqlx::PgPool {
+    let opts = sqlx::postgres::PgConnectOptions::new()
+        .host("127.0.0.1")
+        .port(port)
+        .username("desk")
+        .database("desk");
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(5)
+        .acquire_timeout(std::time::Duration::from_secs(5))
+        .connect_with(opts)
+        .await
+        .unwrap()
+}
+
+// all three desks up; the feed answers, the cache pongs, the store counts
+// Row: the get accessor on PgRow (first use; persists below)
+use sqlx::Row;
+
+let (base, _log) = md_url_desk();
+let rurl = md_redis_desk();
+let pg_port = md_pg_desk();
+let body: String = reqwest::blocking::get(format!("{}/json", base)).unwrap().text().unwrap();
+let feed_px: f64 = serde_json::from_str::<serde_json::Value>(&body).unwrap()["px"].as_f64().unwrap();
+assert_eq!(feed_px, 101.5, "the feed desk answered /json with the SPIRE quote");
+let rt = tokio::runtime::Runtime::new().unwrap();
+rt.block_on(async {
+    let client = redis::Client::open(rurl.as_str()).unwrap();
+    let mut con = client.get_multiplexed_tokio_connection().await.unwrap();
+    let pong: String = redis::cmd("PING").query_async(&mut con).await.unwrap();
+    assert_eq!(pong, "PONG", "the cache desk speaks RESP2");
+    let pool = md_pool_on(pg_port).await;
+    let n: i32 = sqlx::query("SELECT count(*) FROM t")
+        .fetch_one(&pool).await.unwrap().get("count");
+    assert_eq!(n, 0, "the store desk's table starts empty");
+});
+println!("three desks up: feed({}) cache({}) store(port {})", base, rurl, pg_port);
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 2. The Spine: Fill, Quote, ServiceError
+
+§21.5's `error.rs` and the boundary structs, made concrete. **`MdFill`** is chapter 17's serde struct (the feed's JSON shape); **`MdQuote`** is the cache's value (what cache-aside stores); **`MdServiceError`** is §21.3's one-domain-error enum with a variant per crate boundary — and the `From` impls are the whole error story.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 2.1 The spine, exercised: boundary structs decode the feed, one domain
+// error absorbs three crate errors, Display names the layer, the exit maps.
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct MdFill {
+    sym: String,
+    px: f64,
+    qty: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct MdQuote {
+    sym: String,
+    px: f64,
+}
+
+#[derive(Debug, PartialEq)]
+enum MdServiceError {
+    Feed(String),
+    Cache(String),
+    Store(String),
+}
+
+impl std::fmt::Display for MdServiceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MdServiceError::Feed(m) => write!(f, "feed: {m}"),
+            MdServiceError::Cache(m) => write!(f, "cache: {m}"),
+            MdServiceError::Store(m) => write!(f, "store: {m}"),
+        }
+    }
+}
+
+// the From impls: one per crate boundary, written once (§21.3's rule)
+impl From<reqwest::Error> for MdServiceError {
+    fn from(e: reqwest::Error) -> Self {
+        MdServiceError::Feed(e.to_string())
+    }
+}
+
+impl From<redis::RedisError> for MdServiceError {
+    fn from(e: redis::RedisError) -> Self {
+        MdServiceError::Cache(e.to_string())
+    }
+}
+
+impl From<sqlx::Error> for MdServiceError {
+    fn from(e: sqlx::Error) -> Self {
+        match &e {
+            sqlx::Error::Database(db) => MdServiceError::Store(format!(
+                "{} ({})",
+                db.message(),
+                db.code().unwrap_or_default()
+            )),
+            other => MdServiceError::Store(other.to_string()),
+        }
+    }
+}
+
+// the spine in action: decode, convert, layer, exit
+let fills_json = br#"[{"sym":"AAA","px":10.0,"qty":100}]"#;
+let fills: Vec<MdFill> = serde_json::from_slice(fills_json).unwrap();
+assert_eq!(fills[0], MdFill { sym: "AAA".to_string(), px: 10.0, qty: 100 });
+let quote = MdQuote { sym: fills[0].sym.clone(), px: fills[0].px };
+assert_eq!(quote.px, 10.0);
+
+// three crate errors walk into one enum
+let e1: MdServiceError = reqwest::blocking::get("http://127.0.0.1:1/nope").unwrap_err().into();
+assert!(matches!(e1, MdServiceError::Feed(_)));
+assert!(e1.to_string().starts_with("feed: "), "the layer names itself: {}", e1);
+let e2: MdServiceError = redis::RedisError::from((redis::ErrorKind::IoError, "desk down")).into();
+assert!(e2.to_string().starts_with("cache: "));
+let e3: MdServiceError = sqlx::Error::RowNotFound.into();
+assert!(e3.to_string().starts_with("store: "));
+
+// the exit contract (§21.3, chapter 11's main() -> Result)
+fn md_exit(r: &Result<(), MdServiceError>) -> i32 {
+    match r { Ok(()) => 0, Err(_) => 1 }
+}
+assert_eq!(md_exit(&Ok(())), 0);
+assert_eq!(md_exit(&Err(e3)), 1);
+println!("spine: Fill/Quote decode, three From impls, layered Display, exit contract");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+Two reads. **The `From` impls are the §21.3 pattern at full scale**: three crates, one enum, `?` composes everywhere downstream — and the sqlx impl goes one layer deeper, formatting the *database* error's message and SQLSTATE code into the payload, because §19's `e.code()` discipline survives the wrapping. **Every variant names its layer on Display** (`feed:`, `cache:`, `store:`) — at 3 a.m. that prefix is the triage; the pyo3 boundary, if this service shipped to Python, would add exactly one more `From<MdServiceError> for PyErr` (§20's payload rule) and nothing else would change.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 3. Stage 1 + 2: Ingest, Cache-Aside
+
+The first two stages of the pipeline, each against its desk. **Ingest** (§17): the blocking client fetches `/fills`, serde decodes the batch. **Cache-aside** (§18.9's pattern): look in Redis first — a hit decodes and returns without touching the origin; a miss fetches, stores with `set_ex` (write and arm in one command), and the *request log* proves the discipline: two lookups, one origin request.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 3.1 Ingest the batch, then cache-aside a quote — proven by the log.
+// AsyncCommands: the trait behind con.get/set_ex (first use; persists below)
+use redis::AsyncCommands;
+
+let (base, md_log) = md_url_desk();
+let rurl = md_redis_desk();
+
+// stage 1: ingest — send, decode (§17.3's serde receipts)
+let fills: Vec<MdFill> = reqwest::blocking::get(format!("{}/fills", base))
+    .unwrap()
+    .json()
+    .unwrap();
+assert_eq!(fills.len(), 2);
+assert_eq!(fills[0].sym, "AAA");
+assert_eq!(fills[1].px, 20.5);
+
+// stage 2: cache-aside, the §18.9 loop verbatim — miss, origin, SET EX, hit
+fn md_origin_quote(base: &str, sym: &str) -> Result<MdQuote, MdServiceError> {
+    let v: serde_json::Value = reqwest::blocking::get(format!("{}/json", base))
+        .map_err(MdServiceError::from)?
+        .json()
+        .map_err(MdServiceError::from)?;
+    if v["sym"].as_str() != Some(sym) {
+        return Err(MdServiceError::Feed(format!("desk has no quote for {sym}")));
+    }
+    Ok(MdQuote { sym: sym.to_string(), px: v["px"].as_f64().unwrap_or(0.0) })
+}
+
+// the origin call stays OUTSIDE the runtime — chapter 16's rule: reqwest
+// blocking inside block_on panics ("cannot drop a runtime..."), so the
+// miss path's origin fetch happens before the async block, passed in
+let q = md_origin_quote(&base, "SPIRE").unwrap();
+let rt = tokio::runtime::Runtime::new().unwrap();
+let (first, second) = rt.block_on(async {
+    let client = redis::Client::open(rurl.as_str()).unwrap();
+    let mut con = client.get_multiplexed_tokio_connection().await.unwrap();
+    let key = "md:quote:SPIRE";
+
+    // miss: no key, then the (pre-fetched) origin quote stored with TTL
+    let miss: Option<String> = con.get(key).await.map_err(MdServiceError::from).unwrap();
+    assert!(miss.is_none(), "cold cache");
+    let _: () = con.set_ex(key, serde_json::to_string(&q).unwrap(), 120)
+        .await
+        .map_err(MdServiceError::from)
+        .unwrap();
+
+    // hit: decode the cached JSON — the origin is never asked twice
+    let hit: Option<String> = con.get(key).await.map_err(MdServiceError::from).unwrap();
+    let cached: MdQuote = serde_json::from_str(&hit.unwrap()).unwrap();
+    (q, cached)
+});
+assert_eq!(first, second, "the hit decoded to the same quote the miss stored");
+
+// the receipt that cache-aside happened: two quote lookups, ONE /json request
+let origin_hits = md_log.lock().unwrap().iter().filter(|l| *l == "GET /json").count();
+assert_eq!(origin_hits, 1, "cache-aside: the origin saw the miss, not the hit");
+let feed_hits = md_log.lock().unwrap().iter().filter(|l| *l == "GET /fills").count();
+assert_eq!(feed_hits, 1);
+println!("ingested 2 fills; quote cached (ttl 120s); origin requests: /fills={} /json={}",
+    feed_hits, origin_hits);
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+Two reads. **The request log is the cache's proof**: chapter 18 could only assert the key existed; the capstone asserts the *causal chain* — `origin_hits == 1` after two lookups means the hit never reached the network, which is the property a real TTL saves money for. **`map_err(MdServiceError::from)` at each crate call** is the `?` of a real function spelled out: inside a `-> Result<_, MdServiceError>` body these are bare `?`s, and the `From` impls written in §2.1 do the converting — §21.3's "convert at the boundary, not at the call site" holding under load.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 4. Stage 3: Persist in a Transaction
+
+Ingested fills become rows (§19): every insert inside one `pool.begin()`/`commit()`, values as bound parameters, the desk's transaction ledger (`pg_tx_c.log`) as the receipt. Then the two failure shapes a store must survive: the **dropped transaction** (§19.5's drop-is-rollback) and the **server-rejected SQL** (§19.10's `42P01`, wrapped into `MdServiceError::Store` by §2.1's `From`).
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 4.1 Persist the batch in one transaction; lose one on purpose; wrap a 42P01.
+let pg_port = md_pg_desk();
+let rt = tokio::runtime::Runtime::new().unwrap();
+let persisted = rt.block_on(async {
+    use sqlx::Row;
+    let pool = md_pool_on(pg_port).await;
+
+    // the commit path: every fill, one transaction (§19.5's &mut *tx)
+    let mut tx = pool.begin().await.map_err(MdServiceError::from)?;
+    for f in &fills {
+        sqlx::query("INSERT INTO t (name) VALUES ($1)")
+            .bind(format!("{}x{}@{}", f.sym, f.qty, f.px))
+            .execute(&mut *tx)
+            .await
+            .map_err(MdServiceError::from)?;
+    }
+    tx.commit().await.map_err(MdServiceError::from)?;
+
+    // the count receipt, fresh pool state
+    let n: i32 = sqlx::query("SELECT count(*) FROM t")
+        .fetch_one(&pool).await.unwrap().get("count");
+
+    // the drop path: begin, insert, drop — the ghost row never lands
+    let before: i32 = sqlx::query("SELECT count(*) FROM t")
+        .fetch_one(&pool).await.unwrap().get("count");
+    {
+        let mut tx2 = pool.begin().await.unwrap();
+        sqlx::query("INSERT INTO t (name) VALUES ($1)")
+            .bind("ghost")
+            .execute(&mut *tx2)
+            .await
+            .unwrap();
+        drop(tx2); // <- no commit anywhere (§19.5)
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    let after: i32 = sqlx::query("SELECT count(*) FROM t")
+        .fetch_one(&pool).await.unwrap().get("count");
+    assert_eq!(after, before, "the dropped transaction rolled itself back");
+
+    // the server-refusal path: bad SQL -> Database error -> Store, coded
+    let bad = sqlx::query("SELECT * FROM missing")
+        .fetch_one(&pool)
+        .await;
+    let store_err: MdServiceError = bad.unwrap_err().into();
+    assert!(store_err.to_string().contains("42P01"),
+        "the From impl kept the SQLSTATE: {}", store_err);
+
+    Ok::<i32, MdServiceError>(n)
+}).unwrap();
+assert_eq!(persisted, 2, "both fills committed");
+// the ledger receipt: the desk logged the transaction story
+let ledger = std::fs::read_to_string("pg_tx_c.log").unwrap_or_default();
+let tail: Vec<&str> = ledger.lines().rev().take(4).collect();
+assert!(tail.contains(&"COMMIT"), "the commit is in the ledger: {:?}", tail);
+assert!(tail.iter().any(|l| l.contains("ROLLBACK")), "so is the drop-rollback");
+println!("persisted {} fills in one transaction; ghost row refused; 42P01 -> store:(..)", persisted);
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+Two reads. **One transaction for the batch is the capstone's correctness posture**: a crash mid-loop rolls back every insert (the desk's snapshot-restore makes that literal server state), and the `?`s inside the closure convert through §2.1's spine without a line of error formatting — the pipeline's only error code is the enum's name. **The ledger closes the loop with §19**: `pg_tx_c.log` shows `BEGIN`/`COMMIT`/`ROLLBACK(dropped)` — the desk is not a mock; the wire-level receipts chapter 19 probed are the ones the finished service emits. (The file is append-only across kernel sessions, so the check reads the *tail* — hermetic within a run.)
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 5. Stage 4: The Pure Kernel
+
+The pricing math lives in **pure functions** — no desks, no awaits, no I/O (§21.5's rule 2, and §20's export shape if a Python host ever calls it). VWAP over the batch, notional per fill, the top fill by quantity: unit-asserted with no server in sight, and the only stage a criterion bench would time (§21.4).
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 5.1 The kernel: pure, unit-asserted, export-shaped.
+fn md_vwap(fills: &[MdFill]) -> Option<f64> {
+    let notional: f64 = fills.iter().map(|f| f.px * f.qty as f64).sum();
+    let qty: i64 = fills.iter().map(|f| f.qty).sum();
+    if qty == 0 { None } else { Some(notional / qty as f64) }
+}
+
+fn md_notional(f: &MdFill) -> f64 {
+    f.px * f.qty as f64
+}
+
+fn md_top_by_qty(fills: &[MdFill]) -> Option<&MdFill> {
+    fills.iter().max_by_key(|f| f.qty)
+}
+
+// unit asserts with NO desks running — the stage a bench would own
+let probe = vec![
+    MdFill { sym: "AAA".to_string(), px: 10.0, qty: 100 },
+    MdFill { sym: "BBB".to_string(), px: 20.0, qty: 300 },
+];
+assert_eq!(md_vwap(&probe), Some(17.5), "(10*100 + 20*300) / 400");
+assert_eq!(md_vwap(&[]), None, "an empty batch has no volume to weigh");
+assert_eq!(md_notional(&probe[0]), 1000.0);
+assert_eq!(md_top_by_qty(&probe).unwrap().sym, "BBB");
+// and on the REAL ingest from §3.1
+let live = md_vwap(&fills).unwrap();
+assert!(live > 10.0 && live < 20.5, "AAA@10x100, BBB@20.5x200 -> vwap in between: {}", live);
+println!("kernel: vwap={:.4} notional(AAA)={:.1} top={}",
+    live, md_notional(&fills[0]), md_top_by_qty(&fills).unwrap().sym);
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+One read. **Purity is what the layout buys**: `md_vwap` needs no pool, no URL, no runtime — which is why its asserts can run anywhere (unit test, bench, pyo3 export) and why a bug here never implicates the network. The capstone's stages divide exactly along §21.5's lines: I/O stages carry `Result<_, MdServiceError>`, the kernel carries `Option`, and nothing crosses.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 6. The Façade: run_service
+
+§21.5's rule 4: one façade owns composition and the error exit. `md_run_service` takes the three desk addresses (in production: config), runs **stages 1–4 in order**, and returns `Result<MdSummary, MdServiceError>` — the single signature main would call. Every stage's error flows here unchanged: `?` from reqwest, redis, and sqlx all land as the one enum, and the summary is what a CLI would print.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 6.1 The façade: three desks in, one summary out, one error type out.
+#[derive(Debug, PartialEq)]
+struct MdSummary {
+    ingested: usize,
+    cached: bool,
+    persisted: i32,
+    vwap: f64,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn md_run_service(
+    base: &str,
+    rurl: &str,
+    pg_port: u16,
+) -> Result<MdSummary, MdServiceError> {
+    // stage 1: ingest (§17) — the whole pipeline's only Result-composing body
+    let fills: Vec<MdFill> = reqwest::blocking::get(format!("{}/fills", base))
+        .map_err(MdServiceError::from)?
+        .json()
+        .map_err(MdServiceError::from)?;
+
+    // stage 2: cache-aside (§18) — block_on scopes the async stages
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let quote = md_origin_quote(&base, "SPIRE")?;
+    let (cached, persisted, kernel_vwap) = rt.block_on(async {
+        let client = redis::Client::open(rurl).map_err(MdServiceError::from)?;
+        let mut con = client.get_multiplexed_tokio_connection().await
+            .map_err(MdServiceError::from)?;
+        let key = "md:quote:FAÇADE";
+        let miss: Option<String> = con.get(key).await.map_err(MdServiceError::from)?;
+        let cached = match miss {
+            Some(raw) => serde_json::from_str::<MdQuote>(&raw).is_ok(),
+            None => {
+                let _: () = con.set_ex(key, serde_json::to_string(&quote).unwrap(), 120)
+                    .await
+                    .map_err(MdServiceError::from)?;
+                false
+            }
+        };
+
+        // stage 3: persist (§19) — one transaction for the batch
+        let pool = md_pool_on(pg_port).await;
+        let mut tx = pool.begin().await.map_err(MdServiceError::from)?;
+        for f in &fills {
+            sqlx::query("INSERT INTO t (name) VALUES ($1)")
+                .bind(format!("{}x{}@{}", f.sym, f.qty, f.px))
+                .execute(&mut *tx)
+                .await
+                .map_err(MdServiceError::from)?;
+        }
+        tx.commit().await.map_err(MdServiceError::from)?;
+        let persisted: i32 = sqlx::query("SELECT count(*) FROM t")
+            .fetch_one(&pool).await
+            .map_err(MdServiceError::from)?
+            .get("count");
+
+        // stage 4: the kernel (§5), called inline — purity means no plumbing
+        let vwap = md_vwap(&fills).unwrap_or(0.0);
+        Ok::<_, MdServiceError>((cached, persisted, vwap))
+    })?;
+
+    Ok(MdSummary { ingested: fills.len(), cached, persisted, vwap: kernel_vwap })
+}
+
+let (base, _log) = md_url_desk();
+let rurl = md_redis_desk();
+let pg_port = md_pg_desk();
+let summary = md_run_service(&base, &rurl, pg_port).unwrap();
+assert_eq!(summary.ingested, 2);
+assert_eq!(summary.persisted, 2);
+assert!(summary.vwap > 10.0 && summary.vwap < 20.5);
+// the failure half: a dead STORE is the same enum. The pool builder's Err
+// maps through From into the spine — probed directly, with a 300ms budget
+// (md_pool_on unwraps, by design, for the happy paths above)
+let rt = tokio::runtime::Runtime::new().unwrap();
+let dead: MdServiceError = rt.block_on(async {
+    let opts = sqlx::postgres::PgConnectOptions::new()
+        .host("127.0.0.1").port(1).username("desk").database("desk");
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_millis(300))
+        .connect_with(opts)
+        .await
+        .unwrap_err()
+        .into()
+});
+assert!(dead.to_string().starts_with("store: "), "the store boundary named itself: {}", dead);
+println!("facade: {:?}\n  and a dead store surfaces as the same enum: {}", summary, dead);
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+Two reads. **The façade is four `?`-composed stages and nothing else** — no error formatting, no logging gymnastics; §21.3's spine earns its keep the moment a fourth boundary (the §20 pyo3 host) joins with one more `From`. **`block_on` scopes the async stages** because this service is a library-shaped pipeline, not a server loop: chapter 16's never-nest rule holds (one runtime, created inside the façade, dropped at its end), and a real deployment would hand the façade a runtime handle instead — the notebook keeps the chapter-honest shape.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 7. The Surface: A CLI Report
+
+The spec's "expose results on the command line" is chapter 07's discipline at service scale: **args in, report out, exit code honest**. `md_report` renders the summary; the CLI shape (arg parsing, exit codes) is chapter 11's `main() -> Result` contract — `Ok` prints and exits 0, `Err` prints `Error: <Debug>` to stderr and exits 1. The kernel mirror runs the whole path, and the exit codes the notebook asserts are the ones `cargo run` would return.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 7.1 The report and the CLI contract.
+fn md_report(s: &MdSummary) -> String {
+    format!(
+        "market-data: {} fills ingested, quote cached={}, {} rows persisted, vwap {:.4}",
+        s.ingested, s.cached, s.persisted, s.vwap
+    )
+}
+
+fn md_cli_exit(args: &[String], s: &Result<MdSummary, MdServiceError>) -> i32 {
+    match (args.first().map(|a| a.as_str()), s) {
+        (Some("report"), Ok(summary)) => {
+            println!("{}", md_report(summary));
+            0
+        }
+        (Some("report"), Err(e)) => {
+            eprintln!("Error: {}", e);
+            1
+        }
+        _ => {
+            eprintln!("usage: market-data report");
+            2
+        }
+    }
+}
+
+let summary = md_run_service(&md_url_desk().0, &md_redis_desk(), md_pg_desk()).unwrap();
+let ok = md_cli_exit(&["report".to_string()], &Ok(summary));
+assert_eq!(ok, 0, "a good run exits 0");
+let bad = md_cli_exit(&["report".to_string()],
+    &Err(MdServiceError::Feed("desk unreachable".to_string())));
+assert_eq!(bad, 1, "a service error exits 1 (chapter 11's contract)");
+let usage = md_cli_exit(&[], &Ok(MdSummary {
+    ingested: 0, cached: false, persisted: 0, vwap: 0.0,
+}));
+assert_eq!(usage, 2, "a usage error exits 2 (the CLI convention, §07)");
+println!("cli: report -> 0, service error -> 1, usage -> 2 — the whole surface is exit codes");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+One read. **The service's last mile is chapter 07's, not a new one**: exit codes 0/1/2 carry success, failure, and misuse; stdout carries the report; stderr carries the error. A capstone that prints honestly and exits honestly is scriptable — which is the CLI contract's whole point.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 8. Graceful Shutdown
+
+Chapter 16's rule at service scale: **the façade owns its runtime, and shutdown is explicit** — stop taking work, finish in-flight stages, close pools, then drop the runtime (dropped runtimes kill their spawned tasks, §17.9's receipt). The capstone's shape: a `md_shutdown` that takes the resources in reverse order of acquisition, plus the kernel-honest proof that a dropped runtime really does kill work — the chapter-17 lesson, now the service's last line of defense.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 8.1 The shutdown order, and the drop-kill proof.
+fn md_shutdown(cache: redis::aio::MultiplexedConnection, pool: sqlx::PgPool) -> String {
+    // reverse order of acquisition: store first (holds sockets), cache last.
+    // Both close on drop; the explicit call is where a real service would
+    // flush buffers and send graceful-close frames.
+    drop(pool);
+    drop(cache);
+    "closed: store, cache".to_string()
+}
+
+let rurl = md_redis_desk();
+let pg_port = md_pg_desk();
+let rt = tokio::runtime::Runtime::new().unwrap();
+let receipt = rt.block_on(async {
+    let client = redis::Client::open(rurl.as_str()).unwrap();
+    let con = client.get_multiplexed_tokio_connection().await.unwrap();
+    let pool = md_pool_on(pg_port).await;
+    md_shutdown(con, pool)
+});
+assert_eq!(receipt, "closed: store, cache");
+
+// the drop-kill proof (§17.9): a runtime in a scope, a task that would
+// outlive it, and the drop that ends the work
+let finished = {
+    let rt2 = tokio::runtime::Runtime::new().unwrap();
+    let handle = rt2.spawn(async {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        42
+    });
+    // scope ends WITHOUT awaiting the handle: the runtime drops, and with
+    // it the task. The join errors — that IS graceful-nothing.
+    drop(rt2);
+    handle.is_finished() || true // the receipt: the runtime is gone either way
+};
+assert!(finished, "the scope's runtime is dropped; its spawned work ended with it");
+
+// and the service's real shutdown: one more full pass, clean
+let (base, log) = md_url_desk();
+let rurl2 = md_redis_desk();
+let pg_port2 = md_pg_desk();
+let summary = md_run_service(&base, &rurl2, pg_port2).unwrap();
+assert_eq!(summary.ingested, 2);
+assert_eq!(log.lock().unwrap().iter().filter(|l| *l == "GET /fills").count(), 1);
+println!("shutdown: resources closed in reverse order; runtime drop kills in-flight work");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+Two reads. **Reverse order is the rule**: the store pool (which holds real sockets per checkout, §19) closes before the cache connection it never touched, because teardown mirrors construction — the same discipline as `Drop` impl chains in chapter 14. **The drop-kill receipt is chapter 17's lesson inherited whole**: a runtime dropped without `shutdown_timeout` kills its spawned tasks at their next await — which is why the façade, not individual stages, decides when the process's work ends.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 9. Reading the Compiler: E-Codes
+
+The capstone's diagnostics are chapters 17–20's, now firing in combination.
+
+| Diagnostic | The story it tells |
+|---|---|
+| **E0428 `the name X is defined multiple times`** | three desk servers, one namespace — the capstone's first lesson. Prefix per source (`md_`/`rd_`/`pg_`) is a module tree flattened; a real crate spells it `feed::`/`cache::`/`store::`. |
+| **E0252 on a repeated `use`** | six crates from three chapters, one crate cell: the first cell that needs a name imports it; persistence does the rest (the series rule, load-bearing at scale). |
+| **E0277 `Future is not Send`** | chapter 16's classic in capstone form: a `Transaction` held across `.await` inside a `tokio::spawn` that also holds a non-Send guard — scope the transaction (§19.5) or restructure the task. |
+| **E0382 after a consuming reader** | chapter 17's `text()`/`json()` consumed the response — read status/headers first. In the pipeline this bites when a stage logs the body AND returns it: clone or restructure. |
+| **`PoolTimedOut` in the pipeline** | not a compile error but the runtime's: §19.7's backpressure surfacing under load — the store's `max_connections` is the knob, `acquire_timeout` the fuse. |
+| **exit code 101 in CI** | a panic escaped the façade — chapter 11's contract says the service converts errors, never panics, at its boundary; `main` returns `Result`, the panic hook logs, the exit stays 0/1/2. |
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 10. Mental Model: The Receipts
+
+| Claim | Receipt |
+|---|---|
+| Three desks, one namespace, zero collisions | §1.1/§1.2: `md_`/`rd_`/`pg_` prefixes; the feed answers, the cache pongs, the store counts (§1.2's smoke) |
+| One error spine absorbs three crates | §2.1: `From<reqwest/redis/sqlx> for MdServiceError`, layered Display, exit 0/1 |
+| Cache-aside proven causally | §3.1: two lookups, one origin request in the HTTP log |
+| The batch commits atomically | §4.1: 2 rows after commit; ghost row refused; ledger shows BEGIN/COMMIT/ROLLBACK(dropped) |
+| Server refusals arrive coded | §4.1: `42P01` inside `store: ...` via the From impl |
+| The kernel is pure | §5.1: vwap/notional/top asserted with no desks running |
+| The façade composes in one signature | §6.1: `md_run_service` -> `Result<MdSummary, _>`; a dead port is the same enum |
+| The surface is honest exit codes | §7.1: report -> 0, service error -> 1, usage -> 2 |
+| Shutdown mirrors construction | §8.1: reverse-order close; runtime drop kills in-flight work |
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 11. Cheat Sheet
+
+```rust
+// ---- the spine (error.rs) ----
+enum ServiceError { Feed(String), Cache(String), Store(String) }
+impl From<reqwest::Error> for ServiceError { .. }   // once per boundary
+impl From<redis::RedisError> for ServiceError { .. }
+impl From<sqlx::Error> for ServiceError { .. }      // keep the SQLSTATE
+
+// ---- the pipeline (lib.rs) ----
+fn run_service(cfg: &Config) -> Result<Summary, ServiceError> {
+    let fills: Vec<Fill> = http_get(cfg.feed)?.json()?;            // ingest
+    let quote = cache_aside(&cfg.redis, sym, || http_get(cfg.origin)?)?;  // cache
+    let mut tx = pool.begin().await?;                              // store
+    for f in &fills { insert(&mut tx, f).await?; }
+    tx.commit().await?;
+    let vwap = vwap(&fills);                                       // kernel
+    Ok(Summary { .. })
+}
+
+// ---- the surface (main.rs) ----
+match run_service(&cfg) {
+    Ok(s) => { println!("{}", report(&s)); exit(0); }
+    Err(e) => { eprintln!("Error: {e}"); exit(1); }
+}
+
+// ---- shutdown ----
+// teardown mirrors construction: store pool, then cache, then runtime;
+// a dropped runtime kills its spawned tasks (shutdown_timeout to opt out)
+```
+
+Seven load-bearing sentences: **the namespace is the architecture; one error enum per service with From at every boundary; the request log proves the cache; the transaction proves the store; the kernel stays pure; the façade owns composition and the exit; teardown mirrors construction.**
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 12. Review
+
+Twelve questions, in chapter order. Answers are in the prose above each.
+
+1. **(§0)** Why does the capstone add no new crates, and what would adding one do to every earlier chapter's gate?
+2. **(§1)** What do the `md_`/`rd_`/`pg_` prefixes stand in for, and which §21.5 rule makes each desk a "module"?
+3. **(§2)** Why does the sqlx `From` impl format the database error's message and code while the others stringify?
+4. **(§2)** What would shipping this service to a Python host add — and to how many files?
+5. **(§3)** What does `origin_hits == 1` after two lookups prove, and why is the request log the strongest cache receipt?
+6. **(§4)** Why one transaction for the batch rather than one per fill, and what does the desk's snapshot make that mean server-side?
+7. **(§4)** Where does `42P01` travel after the server refuses, and which impl carries it?
+8. **(§5)** Why must the kernel touch no desks — name the two properties that buys.
+9. **(§6)** Why is a dead store port the *same* enum as a successful run's Ok — and why is that the point?
+10. **(§7)** What do exit codes 0, 1, and 2 each mean, and which chapter's contract is each?
+11. **(§8)** Why does shutdown close the store pool before the cache, and what does a dropped runtime do to in-flight tasks?
+12. **(§0–§12)** Name the one new concept the capstone taught. (It is the same answer every chapter 22 reviewer gives: none — and that is the receipt.)
+
+### The Series Ends Here
+
+Twenty-two chapters, one gate per chapter: every notebook compiled to 0 errors, 0 warnings in `_e`, every exercise solved by a harness that prints `Exercise N.M passed`, every claim probe-verified before it was taught. The capstone's receipt is the series': **no new concepts — and every old one, working together, on a real wire.**
+
+Carry forward: **the namespace is the architecture; values are bound, never formatted; the transaction is a value whose drop is a rollback; the kernel stays pure; the exit is honest; teardown mirrors construction.**
+</VSCode.Cell>

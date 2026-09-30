@@ -1,0 +1,52 @@
+tracing=C:/Users/GSL/AppData/Local/Temp/spike09/target/debug/deps/libtracing-1243c1b2feda8797.rlib
+tracing_subscriber=C:/Users/GSL/AppData/Local/Temp/spike09/target/debug/deps/libtracing_subscriber-19945eec6190e148.rlib
+tracing_appender=C:/Users/GSL/AppData/Local/Temp/spike09/target/debug/deps/libtracing_appender-56c8bbfb36ed0e8d.rlib
+tracing_core=C:/Users/GSL/AppData/Local/Temp/spike09/target/debug/deps/libtracing_core-12e23ea034cbc368.rlib
+eyre=C:/Users/GSL/AppData/Local/Temp/spike09/target/debug/deps/libeyre-e4d5639d314e566b.rlib
+
+# REBUILD RECIPE: cargo new a scratch bin with the four deps (edition 2021),
+# export PATH="/c/DEV/msys64/mingw64/bin:$PATH" for dlltool, cargo build,
+# then refresh the lib<crate>-<hash>.rlib paths above.
+
+# --- chapter 15 (spike15 scratch project; time built with macros+formatting+parsing) ---
+chrono=C:/Users/GSL/AppData/Local/Temp/spike15/target/debug/deps/libchrono-c1a664bcddbd30cf.rlib
+time=C:/Users/GSL/AppData/Local/Temp/spike15/target/debug/deps/libtime-d04db6ea6ee6f6ae.rlib
+uuid=C:/Users/GSL/AppData/Local/Temp/spike15/target/debug/deps/libuuid-d7f05ebad7f7f707.rlib
+rust_decimal=C:/Users/GSL/AppData/Local/Temp/spike15/target/debug/deps/librust_decimal-778960f6eaed62b0.rlib
+polars=C:/Users/GSL/AppData/Local/Temp/spike15/target/debug/deps/libpolars-f693b16bc2a4e8bd.rlib
+
+# import libraries dropped by winapi's build script (needed to LINK polars;
+# cargo adds this -L native automatically, the manual rustc gate must too)
+native=C:/DEV/Rust/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/winapi-x86_64-pc-windows-gnu-0.4.0/lib
+
+# --- chapter 16 (spike16 scratch project; tokio 1.53.1 features=full) ---
+# tokio re-hashed when ch17 deps joined spike16, again for ch18's redis, and
+# again for ch19's sqlx (feature unification each time); the newest rlib is a
+# feature superset serving ch16..ch19 alike (16e/17e/18e re-gated on it).
+tokio=C:/Users/GSL/AppData/Local/Temp/spike16/target/debug/deps/libtokio-dce1e8f34dde28e3.rlib
+
+# --- chapter 17 (spike16 extended: reqwest 0.12.28 blocking+json+charset+stream,
+# serde 1.0.229 derive, serde_json 1.0.151, tokio-tungstenite 0.24.0 connect+handshake,
+# futures-util 0.3.34 sink+std). All rlibs below are the SAME cargo wave -- mismatched
+# tokio/futures-util pairs fail with bogus E0277 AsyncRead bounds. Re-hashed (with new
+# hashes recorded) when redis joined for ch18; serde_json and futures-util kept their
+# original hashes (cargo: up-to-date) and still link clean against the new wave.
+# Two libreqwest rlibs exist per wave; the stream-enabled one is the LARGER, later-built
+# libreqwest-<hash> (911748c308b2904f in the ch19 wave).
+reqwest=C:/Users/GSL/AppData/Local/Temp/spike16/target/debug/deps/libreqwest-911748c308b2904f.rlib
+serde=C:/Users/GSL/AppData/Local/Temp/spike16/target/debug/deps/libserde-1d2776118e09fc5a.rlib
+serde_json=C:/Users/GSL/AppData/Local/Temp/spike16/target/debug/deps/libserde_json-c368b775ce1123f4.rlib
+tokio_tungstenite=C:/Users/GSL/AppData/Local/Temp/spike16/target/debug/deps/libtokio_tungstenite-78ba4eb886013dc4.rlib
+futures_util=C:/Users/GSL/AppData/Local/Temp/spike16/target/debug/deps/libfutures_util-ff56a726dce2df9f.rlib
+
+# --- chapter 18 (redis 0.27.6 tokio-comp+serde). Verified against an in-notebook
+# minimal RESP2 server (no real Redis on this machine); see 00_NB-STRUCT.md §17.
+# Re-hashed (b3bfeb30b80119af) when sqlx joined for ch19.
+redis=C:/Users/GSL/AppData/Local/Temp/spike16/target/debug/deps/libredis-b3bfeb30b80119af.rlib
+
+# --- chapter 19 (sqlx 0.8.6 runtime-tokio+postgres; NO macros feature —
+# query!/query_as! need DATABASE_URL at compile time, so the chapter teaches
+# the runtime API + hand-written FromRow; same ch19 wave as re-hashes above).
+# Verified against an in-notebook PostgreSQL v3 wire-protocol server (no real
+# Postgres on this machine); see 00_NB-STRUCT.md §17.
+sqlx=C:/Users/GSL/AppData/Local/Temp/spike16/target/debug/deps/libsqlx-f6d65eb45cdc6ced.rlib

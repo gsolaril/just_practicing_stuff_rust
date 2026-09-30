@@ -1,0 +1,568 @@
+<VSCode.Cell language="markdown">
+# Rust 109: Logging — Practice
+
+Companion exercises for `09_logging_e.ipynb`. Every section mirrors the section of the same number in the example notebook, and there is one exercise for each of its demonstration cells, so a `**See**` reference lands on the exact code that shows the technique.
+
+The checks at the bottom of each cell are the grader. Edit only the parts marked `TODO`; when a cell runs without panicking you will see an `Exercise N.M passed` line.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+### Contents
+
+- [0. How to Complete These Exercises](#0-how-to-complete-these-exercises)
+- [2. Events: Levels and Fields](#2-events-levels-and-fields)
+- [3. Spans: Context That Sticks](#3-spans-context-that-sticks)
+- [4. The Subscriber: Layers, Filters, Sinks](#4-the-subscriber-layers-filters-sinks)
+- [5. File Sinks: `tracing-appender` and the Worker Guard](#5-file-sinks-tracing-appender-and-the-worker-guard)
+- [6. Errors That Carry Their Story with `eyre` and `Backtrace`](#6-errors-that-carry-their-story-with-eyre-and-backtrace)
+- [7. Reading the Compiler: Panics and E-Codes](#7-reading-the-compiler-panics-and-e-codes)
+- [12. Review: Mixed Problems](#12-review-mixed-problems)
+
+§2–§7 each have one exercise per demonstration cell of the example notebook; §12 mixes them. When a check fails, the fastest route back is §11 of the example notebook, which is the one-page cheat sheet.
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 0. How to Complete These Exercises
+
+This notebook runs on the same **evcxr** kernel as the example notebook, and shares its crate chapters' rules. Four consequences shape how you work:
+
+1. **No `fn main`.** The body of a cell *is* the body of `main`. Type statements directly.
+2. **State persists.** A binding from one cell is visible in every cell below it — including `use` lines and loaded crates.
+3. **Items are order-independent.** A `fn` or `struct` may be used above the cell that defines it.
+4. **Crates load with `:dep`, once.** The first exercise cell (0.1) carries the four `:dep` lines; they survive for the whole kernel session, exactly like the example notebook's. Re-running them is harmless (already-loaded crates are no-ops), but changing features requires a kernel restart.
+
+> **Item names must be unique across the whole notebook.** Every cell shares one namespace; two functions with the same name are a redefinition error even in different sections. The exercise names here are unique by construction — do not introduce colliding helpers.
+
+### The stub convention
+
+Each exercise cell declares a signature, a doc comment stating the contract, and a `// --- check (do not modify) ---` block of `assert_eq!`/`assert!` calls. The body you must fill in is `todo!()`, which compiles but **panics** when executed. Replace it and re-run; an `Exercise N.M passed` line means you are done.
+
+### Three notes specific to logging
+
+- **The global subscriber is a one-shot.** The first exercise cell (2.1) installs it with `try_init` behind `let _ =`, so re-runs are safe. No exercise ever calls plain `init()` — there is no un-set, and a panic there would need a kernel restart. Every subscriber *experiment* uses the **scoped dispatch** (`tracing::dispatcher::with_default`) the example notebook teaches in §4.2.
+- **`RUST_BACKTRACE` is cached at the session's first `Backtrace::capture()`.** The backtrace exercise (6.2) asserts only the `force_capture()` half, whose answer never depends on session history — read §6 of the example notebook for the full gate story.
+- **File exercises use `scratch09p/`** and clean up after themselves; nothing outside that directory is touched.
+
+### Expect warnings until you finish
+
+Two warning families are normal and self-cleaning:
+
+- `unused variable` — every unsolved stub whose parameters are untouched;
+- `unused import` — the notebook-wide `use std::backtrace::Backtrace;` (6.2) until that exercise is solved.
+
+Each warning disappears when you implement the body that needs it. If a diagnostic appears that is not in one of those families, it is yours.
+
+**See**: §0 and §7 of the example notebook.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+// 0.1 Load the chapter's crates, then prove the kernel can emit one event.
+// (Once per kernel session; re-running is a no-op.)
+:dep tracing = "0.1"
+:dep tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+:dep tracing-appender = "0.2"
+:dep eyre = "0.6"
+
+use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+let filter = EnvFilter::try_from_default_env()
+    .unwrap_or_else(|_| EnvFilter::new("info"));
+let _ = tracing_subscriber::registry()
+    .with(fmt::layer().with_target(false).with_filter(filter))
+    .try_init(); // Err on re-run — the guard that makes re-runs safe
+tracing::info!("kernel alive, subscriber ready");
+println!("Exercise 0.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+### Exercise 2.1 — The re-run-safe subscriber
+
+**Goal**: reproduce §2.1's setup cell exactly — and know why the `let _ =` matters.
+
+**Given**: nothing; the crates loaded in 0.1 are still in scope, as they will be for the whole notebook.
+
+**Objectives**
+
+- implement `install_subscriber` building the registry + fmt layer (no target, `EnvFilter` defaulting to `"info"`) and `try_init`-ing it
+- return `true` when the install succeeded, `false` when a subscriber was already installed
+- keep the signature unchanged
+
+**See**: §2.1 and §7 of the example notebook.
+
+**Hint**: `..try_init()` returns a `Result` — `.is_ok()` is the whole answer. `use` lines from 0.1 are still in scope; do not re-import.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+/// Install the chapter subscriber (registry + fmt, no target, info default).
+/// True when freshly installed, false when one was already set.
+///
+/// TODO: replace `todo!()` with the registry/layer/try_init chain.
+fn install_subscriber() -> bool {
+    todo!()
+}
+
+// --- check (do not modify) ---
+install_subscriber(); // first call wins (false only if 0.1's install is counted)
+assert!(install_subscriber() == false, "second install must be refused");
+tracing::info!("subscriber is live");
+println!("Exercise 2.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+### Exercise 2.2 — Structured beats stringly
+
+**Goal**: emit one event per level, then prove the *filter* sees structure — not text.
+
+**Objectives**
+
+- implement `emit_levels`: one `error!`, `warn!`, `info!` (with `symbol` and `qty` fields), `debug!` — each mentioning its level name in the message
+- return the count of events emitted (4)
+- keep the signature unchanged
+
+**See**: §2.2 of the example notebook.
+
+**Hint**: four macro calls in sequence; the tail expression is the literal `4`. The `debug!` is emitted even though the info-level filter hides it — emitting is not showing (§9 of the example notebook).
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+/// Emit one event at error/warn/info/debug (info carries symbol + qty fields);
+/// return how many events were emitted.
+///
+/// TODO: replace `todo!()` with the four events and the count.
+fn emit_levels(symbol: &str, qty: u32) -> u8 {
+    todo!()
+}
+
+// --- check (do not modify) ---
+assert_eq!(emit_levels("AAPL", 300), 4);
+println!("Exercise 2.2 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+### Exercise 2.3 — Plain, `%` and `?`
+
+**Goal**: the three field shapes as one function that returns them rendered.
+
+**Objectives**
+
+- implement `field_shapes` returning `(display_form, debug_form)` where the display form is `err.to_string()` and the debug form is `format!("{err:?}")`
+- inside, *emit* one `warn!` using `detail = %err` and one `error!` using `err = ?err` — the fields exercise the sigils
+- keep the signature unchanged
+
+**See**: §2.3 of the example notebook.
+
+**Hint**: `%value` renders `Display`, `?value` renders `Debug` — the returned pair mirrors exactly what the two events record.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+/// Emit one warn (with %err) and one error (with ?err);
+/// return (Display rendering, Debug rendering) of the error.
+///
+/// TODO: replace `todo!()` with the two events and the pair.
+fn field_shapes(err: &std::io::Error) -> (String, String) {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let e = std::io::Error::new(std::io::ErrorKind::NotFound, "feed file");
+let (display, debug) = field_shapes(&e);
+assert_eq!(display, "feed file");
+assert!(debug.contains("NotFound") && debug.contains("feed file"));
+println!("Exercise 2.3 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+### Exercise 3.1 — Context that sticks
+
+**Goal**: prove span context attaches itself: capture the formatted line of an event inside a span.
+
+**Given**: `MemWriter` — the in-memory sink from the example notebook's §4.2 — is provided below, together with its `Write` impl. Use it as the layer's writer; the exercise is the span, not the sink.
+
+**Objectives**
+
+- implement `spanned_line`: inside `tracing::dispatcher::with_default` on a scoped dispatch (fmt layer, `MemWriter`, info filter), enter `info_span!("order", symbol = "AAPL", qty = 300)` and emit `warn!("partial fill")`
+- return the single captured line
+- keep the signature unchanged
+
+**See**: §3.1 and §4.2 of the example notebook.
+
+**Hint**: build the dispatch exactly like §4.2, `with_default(&scoped, || { let _g = info_span!(..).entered(); warn!(..) })`, then `buffer.lock().unwrap().join("\n")`.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+use std::sync::{Arc, Mutex};
+
+/// A writer that appends every formatted line into a shared Vec (§4.2's sink).
+pub struct MemWriter(pub Arc<Mutex<Vec<String>>>);
+impl std::io::Write for MemWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let text = String::from_utf8_lossy(buf).trim().to_string();
+        if !text.is_empty() {
+            self.0.lock().unwrap().push(text);
+        }
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+
+/// Emit "partial fill" inside an order span; return the captured log line.
+///
+/// TODO: replace `todo!()` with the scoped dispatch + span + event.
+fn spanned_line() -> String {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let line = spanned_line();
+assert!(line.contains("partial fill"), "got: {line}");
+assert!(line.contains("order{symbol=\"AAPL\" qty=300}"), "span context missing from: {line}");
+println!("Exercise 3.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+### Exercise 3.2 — The nesting is visible
+
+**Goal**: §3.2's session-inside-order tree, but *asserted*: the captured line must carry both spans.
+
+**Objectives**
+
+- implement `nested_line`: inside one scoped dispatch (fmt layer → `MemWriter`, info filter), enter `info_span!("session", id = 7)`, then `info_span!("order", symbol = "MSFT", qty = 120)`, then emit `info!("submitting")`
+- return the captured line
+- keep the signature unchanged
+
+**See**: §3.2 of the example notebook.
+
+**Hint**: two `.entered()` guards inside the closure, innermost last; the fmt layer prints the chain as `session{id=7}:order{...}:`.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+/// Emit "submitting" inside session{ id = 7 } wrapping order{ MSFT, 120 };
+/// return the captured line showing the full context chain.
+///
+/// TODO: replace `todo!()` with the nested spans inside a scoped dispatch.
+fn nested_line() -> String {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let line = nested_line();
+assert!(line.contains("submitting"), "got: {line}");
+assert!(line.contains("session{id=7}"), "session span missing from: {line}");
+assert!(line.contains("order{symbol=\"MSFT\" qty=120}"), "order span missing from: {line}");
+println!("Exercise 3.2 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+### Exercise 4.1 — The `RUST_LOG` grammar
+
+**Goal**: the filter table as functions — `max_level_hint` is the cell-checkable API.
+
+**Objectives**
+
+- implement `hint_of` returning `EnvFilter::try_new(directives).unwrap().max_level_hint()`
+- implement `per_target_hint` returning the hint for `"feed=debug,app=warn"`
+- keep the signatures unchanged
+
+**See**: §4.1 of the example notebook.
+
+**Hint**: one call each; `max_level_hint()` returns `Option<tracing_core::LevelFilter>` — the coarsest level that passes.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+/// The coarsest level an event may have and still pass the directives.
+///
+/// TODO: replace `todo!()` with try_new + max_level_hint.
+fn hint_of(directives: &str) -> Option<tracing_core::LevelFilter> {
+    todo!()
+}
+
+/// The hint for the per-target string "feed=debug,app=warn".
+///
+/// TODO: replace `todo!()` with a call to hint_of.
+fn per_target_hint() -> Option<tracing_core::LevelFilter> {
+    todo!()
+}
+
+// --- check (do not modify) ---
+assert_eq!(hint_of("info"), Some(tracing_core::LevelFilter::INFO));
+assert_eq!(hint_of("warn"), Some(tracing_core::LevelFilter::WARN));
+assert_eq!(hint_of("feed=debug,app=warn"), Some(tracing_core::LevelFilter::DEBUG));
+assert_eq!(per_target_hint(), Some(tracing_core::LevelFilter::DEBUG));
+println!("Exercise 4.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+### Exercise 4.2 — Fan-out, asserted
+
+**Goal**: one event, two sinks — stdout *and* memory — under a scoped dispatch, with the buffer check.
+
+**Given**: `MemWriter` from exercise 3.1 (order-independent items: it is already usable here).
+
+**Objectives**
+
+- implement `fan_out`: build a scoped dispatch with *two* fmt layers (no target, info filter) — one plain stdout, one writing `MemWriter` — emit `warn!("fan-out probe")` inside `with_default`, and return the captured buffer lines
+- keep the signature unchanged
+
+**See**: §4.2 of the example notebook.
+
+**Hint**: the §4.2 stack with `.with(..).with(..)`; the stdout layer's writer is plain `std::io::stdout()` (skipping `non_blocking` keeps the exercise deterministic); the tail expression is `buffer.lock().unwrap().clone()`.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+/// One scoped dispatch, two layers (stdout + MemWriter), one warn event;
+/// return the lines the memory sink captured.
+///
+/// TODO: replace `todo!()` with the two-layer scoped dispatch and the event.
+fn fan_out() -> Vec<String> {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let lines = fan_out();
+assert_eq!(lines.len(), 1, "the event should reach the memory sink exactly once");
+assert!(lines[0].contains("fan-out probe"), "got: {:?}", lines);
+println!("Exercise 4.2 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+### Exercise 5.1 — Enqueue through the worker
+
+**Goal**: the file sink lesson's first half: a scoped dispatch whose fmt layer writes through `non_blocking(rolling::never(..))`, with the `WorkerGuard` kept alive for the scope.
+
+**Objectives**
+
+- implement `enqueue_to_file`: inside `scratch09p/`, create the rolling-never sink, wrap it in `non_blocking`, build the scoped dispatch (fmt layer, no target, no ANSI, info filter, the non-blocking writer), and inside `with_default` bind the guard *then* emit `info!("enqueued probe")`
+- return nothing; the next exercise reads the file after dropping its own guard
+- keep the signature unchanged
+
+**See**: §5.1 of the example notebook.
+
+**Hint**: the guard must be bound *inside* the closure so it outlives the event but not the dispatch: `with_default(&scoped, || { let _guard = guard; info!(..) })`.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+/// Enqueue one info event to scratch09p/enqueue.log through a non-blocking
+/// worker under a scoped dispatch; the guard lives exactly for the scope.
+///
+/// TODO: replace `todo!()` with the sink + scoped dispatch + guarded event.
+fn enqueue_to_file() {
+    todo!()
+}
+
+// --- check (do not modify) ---
+enqueue_to_file();
+println!("Exercise 5.1 passed (flush is the next exercise's business)");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+### Exercise 5.2 — The flush boundary
+
+**Goal**: prove the rule: the file is only guaranteed readable *after* the guard drops.
+
+**Objectives**
+
+- implement `flush_probe`: build a *fresh* `scratch09p/flush.log` sink, and inside the scoped dispatch emit `warn!("flush probe")` then explicitly `drop` the guard — all while still inside `with_default`
+- after the scope, read the file and return whether it contains the event
+- keep the signature unchanged
+
+**See**: §5.2 of the example notebook.
+
+**Hint**: shadow the guard (`let guard = guard;`) inside the closure, emit, `drop(guard);` — the worker shuts down and flushes on the spot; then the file read outside the scope sees the line.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+/// Emit to scratch09p/flush.log, drop the WorkerGuard inside the scope,
+/// then report whether the file received the event.
+///
+/// TODO: replace `todo!()` with the sink + scoped dispatch + drop + read-back.
+fn flush_probe() -> bool {
+    todo!()
+}
+
+// --- check (do not modify) ---
+assert!(flush_probe(), "the file must hold the event after the guard drops");
+let _ = std::fs::remove_dir_all("scratch09p");
+println!("Exercise 5.2 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+### Exercise 6.1 — The context chain
+
+**Goal**: build §6.1's three-layer `eyre` chain and return both renderings.
+
+**Objectives**
+
+- implement `feed_chain` returning `(display, debug)` for the chain `root cause: connection reset` wrapped in `feed reconnect` wrapped in `market data session`
+- the debug form must contain the `Caused by:` block
+- keep the signature unchanged
+
+**See**: §6.1 of the example notebook.
+
+**Hint**: `eyre::eyre!("root cause: ..").wrap_err(..).wrap_err(..)` — `wrap_err` is an inherent method on `Report`, no trait import needed; `format!("{r}")` vs `format!("{r:?}")`.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+/// Build the feed-failure chain; return (Display, Debug) renderings.
+///
+/// TODO: replace `todo!()` with the chain and the two format! calls.
+fn feed_chain() -> (String, String) {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let (display, debug) = feed_chain();
+assert_eq!(display, "market data session");
+assert!(debug.contains("Caused by:"));
+assert!(debug.contains("0: feed reconnect"));
+assert!(debug.contains("1: root cause: connection reset"));
+println!("Exercise 6.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+### Exercise 6.2 — The gate and the forcing function
+
+**Goal**: the deterministic half of §6.2: `force_capture()` ignores `RUST_BACKTRACE` entirely.
+
+**Objectives**
+
+- implement `forced_frames` capturing with `force_capture()` and returning `(status_is_captured, frame_count, contains_main)`
+- keep the signature unchanged
+
+**See**: §6.2 of the example notebook.
+
+**Hint**: `bt.status()` compared against `BacktraceStatus::Captured` via `matches!`; `format!("{bt}").lines().count()`; the text contains `"main"` on this toolchain (~40 frames).
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+use std::backtrace::Backtrace;
+
+/// force_capture(): (status Captured, frame count, text contains "main").
+///
+/// TODO: replace `todo!()` with the capture and the triple.
+fn forced_frames() -> (bool, usize, bool) {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let (captured, frames, has_main) = forced_frames();
+assert!(captured, "force_capture must be Captured regardless of the gate");
+assert!(frames > 5, "expected a real stack walk, got {frames} frames");
+assert!(has_main, "frames should symbolise far enough to include main");
+println!("Exercise 6.2 passed ({frames} frames)");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+### Exercise 6.3 — The Loguru `exception()` pattern
+
+**Goal**: assemble the chapter's answer: one `error!` carrying message, chain and backtrace — captured into a buffer you can assert on.
+
+**Given**: `MemWriter` (3.1) and `feed_chain` (6.1) are already defined — reuse both.
+
+**Objectives**
+
+- implement `exception_event`: build the chain (reuse `feed_chain`'s construction inline or call it and rebuild — the event needs the *report object*, so construct it here), `force_capture()` a backtrace, then inside a scoped dispatch (fmt layer → `MemWriter`, no target, info filter) emit `error!(error = %report, backtrace = %bt, "pipeline failed")`
+- return the captured line
+- keep the signature unchanged
+
+**See**: §6.3 of the example notebook.
+
+**Hint**: the event is one macro call with two `%`-fields; the captured line contains the message *and* the chain's headline (`market data session`) — the multi-line backtrace lands on the following lines.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+/// Emit the Loguru-style exception event (message + error chain + backtrace);
+/// return the captured first line.
+///
+/// TODO: replace `todo!()` with the chain + force_capture + scoped error! event.
+fn exception_event() -> String {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let line = exception_event();
+assert!(line.contains("pipeline failed"), "got: {line}");
+assert!(line.contains("market data session"), "the %report chain must be on the event: {line}");
+println!("Exercise 6.3 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+### Exercise 7.1 — The singleton refuses a second tenant
+
+**Goal**: §7.1's behaviour as a function: a second `try_init` must be refused.
+
+**Objectives**
+
+- implement `second_install_refused` building a *distinct* subscriber stack (registry + fmt layer, ANSI off) and returning `true` when `try_init` returns `Err`
+- keep the signature unchanged
+
+**See**: §7 of the example notebook.
+
+**Hint**: the 0.1/2.1 subscriber is still installed — so `try_init()` on any new stack errs; `.is_err()` is the answer. This is the one exercise that *depends* on session state, and that dependence is the lesson.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+/// Try to install a second global subscriber; true when it is refused.
+///
+/// TODO: replace `todo!()` with the second stack and try_init.
+fn second_install_refused() -> bool {
+    todo!()
+}
+
+// --- check (do not modify) ---
+assert!(second_install_refused(), "the global slot is a singleton: the second install must err");
+println!("Exercise 7.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+## 12. Review: Mixed Problems
+
+Two problems that chain several sections together — no new material, only assembly.
+
+### Exercise 12.1 — A structured order pipeline
+
+**Goal**: the §3+§6 story in one function: span-wrapped work that fails and reports itself.
+
+**Objectives**
+
+- implement `pipeline_probe`: inside a scoped dispatch (fmt layer → `MemWriter`, no target, no ANSI, info filter), enter `info_span!("pipeline", symbol = "NVDA")`, emit `info!("starting")`, build a one-wrap chain (`wrap_err("pipeline step")` over `eyre!("disk full")`), emit `error!(error = %report, "pipeline failed")`, and return the captured lines
+- the first line must carry the span context and `starting`; the last must carry `pipeline failed` and the chain headline (`pipeline step` — the `%report` field records the outermost message, exactly as §6.1 taught)
+- keep the signature unchanged
+
+**See**: §3.1, §4.2 and §6.3 of the example notebook.
+
+**Hint**: one `with_default` closure does all four steps; guards live inside it; `buffer.lock().unwrap().clone()` is the return.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+/// Run the mini-pipeline under a scoped dispatch; return every captured line.
+///
+/// TODO: replace `todo!()` with the span, the two events, and the chain.
+fn pipeline_probe() -> Vec<String> {
+    todo!()
+}
+
+// --- check (do not modify) ---
+let lines = pipeline_probe();
+assert!(lines.len() >= 2, "expected at least two events, got {:?}", lines);
+assert!(lines[0].contains("pipeline{symbol=\"NVDA\"}") && lines[0].contains("starting"));
+let last = lines.last().unwrap();
+assert!(last.contains("pipeline failed") && last.contains("pipeline step"), "got: {last}");
+println!("Exercise 12.1 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+### Exercise 12.2 — Filter dialects side by side
+
+**Goal**: §4's grammar as a decision table you can defend: three directive strings, three hints, one rationale.
+
+**Objectives**
+
+- implement `filter_table` returning the three hints for `"info"`, `"warn"`, and `"tracing=warn,my_app=debug"` *in that order* as a tuple
+- keep the signature unchanged
+
+**See**: §4.1 and §9 of the example notebook.
+
+**Hint**: three `hint_of` calls; the third one's answer is `Some(DEBUG)` — the per-target form lets a dependency stay quiet while your own crate stays loud.
+</VSCode.Cell>
+<VSCode.Cell language="rust">
+/// (hint of "info", hint of "warn", hint of "tracing=warn,my_app=debug").
+///
+/// TODO: replace `todo!()` with the three hint_of calls.
+type LevelHint = Option<tracing_core::LevelFilter>;
+
+/// TODO: replace `todo!()` with the three hint_of calls.
+fn filter_table() -> (LevelHint, LevelHint, LevelHint) {
+    todo!()
+}
+
+// --- check (do not modify) ---
+use tracing_core::LevelFilter;
+assert_eq!(filter_table(), (Some(LevelFilter::INFO), Some(LevelFilter::WARN), Some(LevelFilter::DEBUG)));
+println!("Exercise 12.2 passed");
+</VSCode.Cell>
+<VSCode.Cell language="markdown">
+### What Comes Next
+
+Chapter 09's exercises close the core track: the language, the standard library's surfaces, the checking toolkit, and now the program's ability to narrate itself. The applied track begins.
+
+| Chapter | Title | What it settles |
+|---|---|---|
+| **10** | **Structs, OOP and Traits** | your own types — the `Debug`/`Display` impls this chapter's fields kept rendering |
+| 11 | Errors in Depth | real error types behind the `eyre::Report`s you built here |
+| 15 | Data Types and Their Libraries | the next crate chapter — the `:dep` pattern you just exercised repeats there |
+
+**Carry forward.** You should now be able to do these without looking anything up:
+
+- install a re-run-safe subscriber and explain the singleton behind the guard
+- emit structured events, wrap work in spans, and capture both into a custom sink for testing
+- read and write `RUST_LOG` directives, including the per-target form
+- drive a rolling file sink and name the exact flush point
+- build an `eyre` chain, force a backtrace, and log both in one event
+</VSCode.Cell>
