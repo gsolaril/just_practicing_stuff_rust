@@ -806,6 +806,12 @@ Verify any semantic claim you are not certain of with a throwaway probe program.
 
 ### 3. Build the notebook, then validate `_e`
 
+**The notebooks are the canonical artifacts.** The plain-text `.src` authoring
+aggregates were deleted after series completion: the notebooks carry the gated state
+where the two ever diverged (04e), every gate runs on the `.ipynb` directly, and cells
+can be re-wrapped into `.src` form losslessly if a chapter is ever revised. `_build_nb.py` is kept
+(§19) for that reason. The historical workflow was:
+
 ```bash
 cat _<NN>v_part*.src > NN_<slug>_e.src   # or author the aggregate directly
 python _build_nb.py       NN_<slug>_e.src
@@ -880,7 +886,7 @@ run and validation logs, and the `pg_tx*.log` ledger receipts. `_patch_meta.py` 
 retired with them. `_validate.py` went too — a mistake, since `_crate_validate.py`
 imports it — and was reconstructed from the contract in §14 on 2026-09-30 and
 re-proven (01e 0/0/0, 17e 0/0/0 through the bridge, 01p stub state 0 err / exit 101).
-`00_NB-STRUCT.md`, the `NN_*_[ep].src` aggregates, `_build_nb.py`, `_validate.py`,
+`00_NB-STRUCT.md`, `_build_nb.py`, `_validate.py`,
 `_crate_validate.py` and `_externs.txt` remain (§19).
 
 ## 16. Hard-Won Gotchas
@@ -1189,11 +1195,12 @@ project scaffolding (`Cargo.toml`, `Cargo.lock`, `src/`, `target/`) alone.
 After the end-of-series cleanup, four workspace files remain around the notebooks.
 Each exists for one reason; none is a deliverable.
 
-### `_build_nb.py` — the notebook builder
+### `_build_nb.py` — the notebook builder (kept for possible authoring)
 
-The notebooks' source of truth is the plain-text aggregate `NN_<slug>_[ep].src`,
-whose cells are delimited by `<VSCode.Cell language="markdown">` / `"rust">` lines.
-The builder turns one aggregate into a `.ipynb`:
+The notebooks are the series' source of truth; the `.src` aggregates they were built
+from were deleted at series completion (see §15 step 3). The builder remains because
+a chapter revision can regenerate a `.src` — wrap each cell as
+`<VSCode.Cell language="markdown">` / `"rust">` … `</VSCode.Cell>` — and rebuild:
 
 ```bash
 python _build_nb.py 17_http-and-websockets_e.src
@@ -1202,8 +1209,8 @@ python _build_nb.py 17_http-and-websockets_e.src
 It emits each cell with the exact metadata the series requires — the evcxr
 kernelspec, `language_info`, `vscode.languageId: "rust"` on code cells, empty
 `outputs` and `execution_count` — so no separate metadata pass is ever needed.
-Every notebook in the workspace was produced this way and can be reproduced from
-its `.src` with this one command.
+Rebuilding is cell-identical to editing the notebook JSON by hand, and is how every
+notebook in the workspace was originally produced.
 
 ### `_validate.py` — the compile-and-run harness (std chapters)
 

@@ -1,0 +1,22 @@
+# --- notebook build stuff ---
+*.src
+*.log
+
+# --- validator / harness scratch (rebuilt on every gate run) ---
+_check.rs
+_check.exe
+_sol*.rs
+_sol*.exe
+
+# --- Rust build ---
+target/
+
+# --- Python / Jupyter ---
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# --- OS crap ---
+Thumbs.db
+desktop.ini
+.DS_Store

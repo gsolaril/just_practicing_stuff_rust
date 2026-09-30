@@ -110,10 +110,9 @@ Python interop, and a capstone that assembles it all.
 ```text
 .
 ├── 00_NB-STRUCT.md        # the governing spec: authoring rules, gates, stuff, tracker
-├── NN_<slug>_e.ipynb      # 22 example notebooks
+├── NN_<slug>_e.ipynb      # 22 example notebooks — the canonical course artifacts
 ├── NN_<slug>_p.ipynb      # 22 practice twins
-├── NN_<slug>_[ep].src     # plain-text cell sources (chapters 03+) the notebooks are built from
-├── _build_nb.py           # .src → .ipynb builder (writes kernelspec & cell metadata)
+├── _build_nb.py           # optional: rebuild a notebook from a regenerated plain-text cell source
 ├── _validate.py           # compile-and-run gate for std-only notebooks
 ├── _crate_validate.py     # gate for crate chapters (offline, via prebuilt rlibs)
 └── _externs.txt           # frozen rlib manifest used by the crate gate
@@ -122,18 +121,20 @@ Python interop, and a capstone that assembles it all.
 ### Tooling (only if you want to rebuild/re-gate)
 
 ```bash
-# rebuild a notebook from its text source
-python _build_nb.py NN_<slug>_e.src
-
 # gate an std-only notebook: 0 errors, 0 warnings, exit 0
 python _validate.py NN_<slug>_e.ipynb
 
 # gate a crate chapter notebook (needs the rlibs listed in _externs.txt)
 python _crate_validate.py NN_<slug>_e.ipynb
+
+# (only when revising a chapter) rebuild from a regenerated plain-text cell source
+python _build_nb.py NN_<slug>_e.src
 ```
 
 The crates the gate needs are prebuilt rlibs whose absolute paths live in
 `_externs.txt`. Don't move or delete those build directories if you plan to re-gate.
+The notebooks themselves are the canonical artifacts — the plain-text `.src` sources
+they were authored from were removed after the series shipped.
 
 ## Status
 
