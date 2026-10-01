@@ -1,0 +1,38 @@
+# Chapter-scoped externs for 24e/24p (advanced string manipulation).
+# Selected only when EXTERNS_FILE=_externs_24.txt is set for the ch24 gate;
+# _externs.txt stays frozen for every other chapter.
+#
+# WHY A SECOND FILE: spike24 (regex/csv/scraper wave) re-hashed serde and
+# serde_json, and the new serde instance is INCOMPATIBLE with the one reqwest,
+# redis, sqlx (spike16) and polars (spike15) were compiled against. Mixing
+# them in one rustc namespace fails with
+#   error[E0277]: the trait bound `Fill: serde::Serialize` is not satisfied
+# on the derive side, because two crate instances of serde cannot see each
+# other's impls. The reverse direction is safe: polars/_mix probes showed the
+# old-wave rlibs coexist with the new serde as long as no type crosses.
+# So ch24 compiles against the ENTIRE spike24 wave for regex/csv/serde/serde_json
+# and keeps polars on its original spike15 rlib (ch15 rows in _externs.txt are
+# therefore untouched; ch16-23 gates never re-run against this file).
+#
+# REBUILD RECIPE: cargo new a scratch bin (edition 2024) with
+#   regex = "1", csv = "1", serde = { version = "1", features = ["derive"] },
+#   serde_json = "1", scraper = "0"
+# export PATH="/c/DEV/msys64/mingw64/bin:$PATH" for dlltool, cargo build,
+# then refresh the lib<crate>-<hash>.rlib paths below (and check whether
+# polars' spike15 rlib still matches _externs.txt row 15).
+
+# --- chapter 24 (spike24 scratch project; regex 1.13.1, csv 1.4.0,
+# serde 1.0.229 derive, serde_json 1.0.151, scraper 0.27.0) ---
+regex=C:/Users/GSL/AppData/Local/Temp/spike24/target/debug/deps/libregex-410d71ed08dd70f5.rlib
+csv=C:/Users/GSL/AppData/Local/Temp/spike24/target/debug/deps/libcsv-2c64e8dbbba794bd.rlib
+serde=C:/Users/GSL/AppData/Local/Temp/spike24/target/debug/deps/libserde-74115fcc69238aed.rlib
+serde_json=C:/Users/GSL/AppData/Local/Temp/spike24/target/debug/deps/libserde_json-25c7b7a87ef266c3.rlib
+scraper=C:/Users/GSL/AppData/Local/Temp/spike24/target/debug/deps/libscraper-ee4d1f8be86e57ac.rlib
+
+# polars reuses the ch15 wave (feature set csv+lazy+temporal+strings already
+# carries everything 24e uses); keep the same rlib _externs.txt row 15 maps.
+polars=C:/Users/GSL/AppData/Local/Temp/spike15/target/debug/deps/libpolars-f693b16bc2a4e8bd.rlib
+
+# import libraries dropped by winapi's build script (needed to LINK polars;
+# same convention as _externs.txt)
+native=C:/DEV/Rust/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/winapi-x86_64-pc-windows-gnu-0.4.0/lib

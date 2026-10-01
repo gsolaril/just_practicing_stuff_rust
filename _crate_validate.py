@@ -12,12 +12,15 @@ import libraries from build scripts (winapi's libwinapi_*.a etc.) that cargo
 picks up automatically but a manual rustc call must be told about.
 Set RUST_LOG in the environment before calling to test env-filtered output.
 """
+import os
 import pathlib
 import re
 import subprocess
 import sys
 
-EXTERNS_FILE = pathlib.Path("_externs.txt")
+# Chapter-scoped override (e.g. EXTERNS_FILE=_externs_24.txt for ch24, whose
+# serde/serde_json wave re-hashed -- see _externs_24.txt header).
+EXTERNS_FILE = pathlib.Path(os.environ.get("EXTERNS_FILE", "_externs.txt"))
 
 
 def read_externs():
