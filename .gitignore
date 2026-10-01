@@ -8,6 +8,9 @@ _check.exe
 _sol*.rs
 _sol*.exe
 
+# --- chapter desks (built by notebook cells at runtime) ---
+scratch23/
+
 # --- Rust build ---
 target/
 

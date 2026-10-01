@@ -50,3 +50,9 @@ redis=C:/Users/GSL/AppData/Local/Temp/spike16/target/debug/deps/libredis-b3bfeb3
 # Verified against an in-notebook PostgreSQL v3 wire-protocol server (no real
 # Postgres on this machine); see 00_NB-STRUCT.md §17.
 sqlx=C:/Users/GSL/AppData/Local/Temp/spike16/target/debug/deps/libsqlx-f6d65eb45cdc6ced.rlib
+
+# --- chapter 23 (spike23 scratch project; clap 4.6.7 features=derive). tokio reuses
+# the ch16-19 wave above (features=full already carries the `process` module --
+# verified in-kernel and standalone). The chapter's docker-stub desk is built
+# IN-NOTEBOOK by spawning rustc (no prebuilt artifact needed); see 00_NB-STRUCT.md §17.
+clap=C:/Users/GSL/AppData/Local/Temp/spike23/target/debug/deps/libclap-fd8945c241aaa80d.rlib
