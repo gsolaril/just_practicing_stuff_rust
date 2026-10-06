@@ -69,6 +69,10 @@ Chapters 10–22 are the **applied track**: structs → errors → iterators →
 smart pointers, then crates for time/data, the async pivot, network/cache/database,
 Python interop, and a capstone that assembles it all.
 
+> **DLC (23–26):** the story didn't end at the capstone. Same twin-notebook format,
+> same discipline — processes & CLI (23), advanced string manipulation (24), unit
+> tests (25), and macros (26).
+
 | # | Chapter | Topics in one line |
 |---|---|---|
 | 01 | Syntax, Printing and Types | bindings, scalars, operators, casting, `format!`, tuples/arrays |
@@ -93,6 +97,10 @@ Python interop, and a capstone that assembles it all.
 | 20 | PyO3: Rust Inside Python | `#[pyfunction]`/`#[pyclass]`, error bridge, cdylib + `pytest` |
 | 21 | Capstone Prep and Real-World Practice | crate docs/features, criterion, service layout |
 | 22 | Capstone: Market Data Service | WebSocket feed → Redis cache → PostgreSQL, CLI + shutdown |
+| 23 | CLI and Processes | `input()` via piped child stdin, `std::process::Command` sync, `tokio::process` async, `clap` |
+| 24 | Advanced String Manipulation | `regex`, CSV/JSON → `Vec`/`HashMap`, `polars` DataFrames, `scraper` basics |
+| 25 | Unit Tests | `#[test]`, the `assert` family, `#[should_panic]`, fixtures & teardown, `cargo test` |
+| 26 | Macros | `macro_rules!`, fragment specifiers, repetition, hygiene |
 
 ## How the practice notebooks work
 
