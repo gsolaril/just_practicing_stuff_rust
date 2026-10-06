@@ -10,6 +10,7 @@ _sol*.exe
 
 # --- chapter desks (built by notebook cells at runtime) ---
 scratch23/
+scratch25/
 
 # --- Rust build ---
 target/

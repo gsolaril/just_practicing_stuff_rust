@@ -47,22 +47,141 @@ def _item_lead(line):
     return line.startswith(ITEM_LEADS)
 
 
-def _opens_block(line):
-    """True while an item header is still incomplete: no `{` and no `;` yet."""
-    stripped = line
-    pos = stripped.find("//")
-    if pos != -1:
-        stripped = stripped[:pos]
-    return "{" not in stripped and ";" not in stripped
+class _StrState:
+    """String/comment lexer state threaded across the lines of one cell.
+
+    Tracks raw strings `r"..."`/`r#"..."#`, plain `"..."` strings and `/* */`
+    comments so brace counting never sees delimiters inside them. Raw strings
+    (and plain strings, and comments) may span lines; state carries over.
+    """
+
+    __slots__ = ("raw", "plain", "block")
+
+    def __init__(self):
+        self.raw = None    # inside a raw string: number of '#' guards (r"..." -> 0)
+        self.plain = False  # inside a "..." string
+        self.block = 0     # nesting depth of /* */ comments
+
+    def open(self):
+        return self.raw is not None or self.plain or self.block > 0
 
 
-def _depth_delta(line):
-    """Brace-depth change over one line, ignoring braces inside line comments."""
-    code = line
-    pos = code.find("//")
-    if pos != -1:
-        code = code[:pos]
-    return code.count("{") - code.count("}")
+def _ident(c):
+    return c.isalnum() or c == "_"
+
+
+def _scan_line(line, st):
+    """Scan one line, updating st in place.
+
+    Returns (delta, header_end): the brace-depth change over code outside
+    strings/comments, and whether a `{` or `;` appeared there (which ends an
+    item's header). Char literals vs lifetimes (`'{'` vs `'a`) are told apart
+    by lookahead, so `'{'` never counts as a brace and `&'static` stays sane.
+    """
+    delta = 0
+    header_end = False
+    i = 0
+    n = len(line)
+    while i < n:
+        c = line[i]
+        if st.raw is not None:
+            h = st.raw
+            if c == '"':
+                j = i + 1
+                cnt = 0
+                while j < n and line[j] == '#':
+                    cnt += 1
+                    j += 1
+                if cnt >= h:  # closing "### (any surplus '#'s are code)
+                    st.raw = None
+                    i = i + 1 + h
+                    continue
+            i += 1
+            continue
+        if st.plain:
+            if c == '\\':
+                i += 2
+                continue
+            if c == '"':
+                st.plain = False
+            i += 1
+            continue
+        if st.block:
+            if c == '/' and i + 1 < n and line[i + 1] == '*':
+                st.block += 1
+                i += 2
+                continue
+            if c == '*' and i + 1 < n and line[i + 1] == '/':
+                st.block -= 1
+                i += 2
+                continue
+            i += 1
+            continue
+        # ---- code context ----
+        if c == '/' and i + 1 < n and line[i + 1] == '/':
+            break  # line comment: rest of the line is inert
+        if c == '/' and i + 1 < n and line[i + 1] == '*':
+            st.block += 1
+            i += 2
+            continue
+        if c == '"':
+            st.plain = True
+            i += 1
+            continue
+        if c == 'r' and (i == 0 or not _ident(line[i - 1])):
+            j = i + 1
+            while j < n and line[j] == '#':
+                j += 1
+            if j < n and line[j] == '"':
+                st.raw = j - i - 1
+                i = j + 1
+                continue
+            i += 1
+            continue
+        if c == 'b' and (i == 0 or not _ident(line[i - 1])):
+            j = i + 1
+            if j < n and line[j] == 'r':
+                k = j + 1
+                while k < n and line[k] == '#':
+                    k += 1
+                if k < n and line[k] == '"':
+                    st.raw = k - j - 1
+                    i = k + 1
+                    continue
+            if j < n and line[j] == '"':
+                st.plain = True
+                i = j + 1
+                continue
+            i += 1
+            continue
+        if c == "'":
+            if i + 2 < n and line[i + 1] == '\\':
+                # Escape inside a char literal: \n \' \\ \u{...}. Find the close.
+                j = i + 2
+                if line[j] == 'u':
+                    k = line.find('}', j)
+                    if k != -1 and k + 1 < n and line[k + 1] == "'":
+                        i = k + 2
+                        continue
+                elif j < n and line[j] == "'":
+                    i = j + 1
+                    continue
+                i = j + 1
+                continue
+            if i + 2 < n and line[i + 2] == "'":
+                i += 3  # char literal 'x'
+                continue
+            i += 1  # lifetime like 'a
+            continue
+        if c == '{':
+            delta += 1
+            header_end = True
+        elif c == '}':
+            delta -= 1
+        elif c == ';':
+            header_end = True
+        i += 1
+    return delta, header_end
 
 
 def split_cell(src):
@@ -76,28 +195,41 @@ def split_cell(src):
     lines = src.split("\n")
     i = 0
     n = len(lines)
+    cell_st = _StrState()
     while i < n:
         line = lines[i]
-        if line and not line[0].isspace() and (_item_start(line) or _item_lead(line)):
+        if (
+            not cell_st.open()
+            and line
+            and not line[0].isspace()
+            and (_item_start(line) or _item_lead(line))
+        ):
             block = [line]
-            depth = _depth_delta(line)
+            st = _StrState()
+            depth, header_end = _scan_line(line, st)
             i += 1
             # Glue: doc/attribute leads, and header continuation lines until the
-            # header terminates in `{` or `;` (multi-line signatures, where-clauses).
+            # header terminates in `{` or `;` (multi-line signatures, where-clauses;
+            # `const X: &str = r#"..."#;` bodies ride along via the string state).
             while i < n and depth == 0 and (
-                _item_lead(lines[i]) or _opens_block(block[-1])
+                _item_lead(lines[i]) or not header_end
             ):
                 block.append(lines[i])
-                depth += _depth_delta(lines[i])
+                d, he = _scan_line(lines[i], st)
+                depth += d
+                header_end = header_end or he
                 i += 1
-            # Consume the body until braces balance again.
-            while i < n and depth > 0:
+            # Consume the body until braces balance and no string is open.
+            while i < n and (depth > 0 or st.open()):
                 block.append(lines[i])
-                depth += _depth_delta(lines[i])
+                d, _he = _scan_line(lines[i], st)
+                depth += d
                 i += 1
             items.extend(block)
+            cell_st = st
         else:
             stmts.append(line)
+            _scan_line(line, cell_st)
             i += 1
     return items, stmts
 
