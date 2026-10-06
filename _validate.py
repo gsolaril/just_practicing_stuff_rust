@@ -31,6 +31,7 @@ ITEM_STARTS = (
     "pub fn ", "const fn ", "async fn ", "pub(crate) fn ",
     "fn ", "const ", "static ", "type ", "use ", "impl",
     "struct ", "enum ", "trait ", "mod ", "pub ",
+    "macro_rules",  # hoists like the kernel: later cells can invoke it
 )
 # Lines that belong to the *next* item when they sit directly above it.
 ITEM_LEADS = ("#[", "///", "//!")
